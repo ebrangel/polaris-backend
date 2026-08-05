@@ -3,13 +3,20 @@ name = "polaris-backend"
 version = "0.1.0"
 description = "API de consultas analíticas multi-banco"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.1",
+    "elasticsearch[async]>=8.0",
+]
 
 [dependency-groups]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "testcontainers[postgres]>=4.0"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "tests"]
 testpaths = ["tests"]
 addopts = "-ra"
 asyncio_mode = "auto"
+markers = [
+    "integration: sobe containers Docker reais (testcontainers) — mais lento",
+]

@@ -6,8 +6,11 @@ in-memory que o Marco 4 vai reutilizar para testar a orquestração do `ExecuteQ
 import inspect
 
 import pytest
+from elasticsearch import AsyncElasticsearch
 from fixtures import vendas_agregado_uf, vendas_schema
+from sqlalchemy.ext.asyncio import create_async_engine
 
+from adapters.executors import ElasticsearchQueryExecutor, SQLAlchemyQueryExecutor
 from application.ports.cache_gateway import CacheGateway
 from application.ports.catalog_repository import CatalogRepository
 from application.ports.job_queue import JobQueue
@@ -52,34 +55,38 @@ def test_fake_satisfaz_o_protocol(port, pair):
     assert isinstance(fake, port)
 
 
+def _assert_signature_matches(port: type, method_name: str, impl: object) -> None:
+    """`isinstance` não compara parâmetros nem sincronia — comparamos à mão para que um
+    adapter (fake ou real) que mude a ordem dos parâmetros ou vire síncrono quebre aqui,
+    e não silenciosamente ao rodar contra um banco de verdade."""
+    port_method = getattr(port, method_name)
+    impl_method = getattr(impl, method_name)
+
+    assert inspect.iscoroutinefunction(port_method), (
+        f"{port.__name__}.{method_name} precisa ser `async def`"
+    )
+    assert inspect.iscoroutinefunction(impl_method), (
+        f"{type(impl).__name__}.{method_name} precisa ser `async def`"
+    )
+
+    port_params = list(inspect.signature(port_method).parameters)[1:]  # sem `self`
+    impl_params = list(inspect.signature(impl_method).parameters)
+    assert port_params == impl_params, (
+        f"{method_name}: port pede {port_params}, {type(impl).__name__} declara {impl_params}"
+    )
+
+
 @pytest.mark.parametrize(
     "port, pair",
     PORT_METHODS.items(),
     ids=[p.__name__ for p in PORT_METHODS],
 )
 def test_metodos_do_fake_tem_a_mesma_assinatura_do_port(port, pair):
-    """`isinstance` não compara parâmetros nem sincronia — comparamos à mão para que um
-    adapter (fake ou real) que mude a ordem dos parâmetros ou vire síncrono quebre aqui,
-    e não silenciosamente ao rodar contra um banco de verdade."""
     fake_class, method_names = pair
     fake = fake_class()
 
     for method_name in method_names:
-        port_method = getattr(port, method_name)
-        fake_method = getattr(fake, method_name)
-
-        assert inspect.iscoroutinefunction(port_method), (
-            f"{port.__name__}.{method_name} precisa ser `async def`"
-        )
-        assert inspect.iscoroutinefunction(fake_method), (
-            f"{fake_class.__name__}.{method_name} precisa ser `async def`"
-        )
-
-        port_params = list(inspect.signature(port_method).parameters)[1:]  # sem `self`
-        fake_params = list(inspect.signature(fake_method).parameters)
-        assert port_params == fake_params, (
-            f"{method_name}: port pede {port_params}, fake declara {fake_params}"
-        )
+        _assert_signature_matches(port, method_name, fake)
 
 
 def test_todos_os_ports_sao_runtime_checkable():
@@ -87,6 +94,34 @@ def test_todos_os_ports_sao_runtime_checkable():
         assert getattr(port, "_is_runtime_protocol", False), (
             f"{port.__name__} precisa de @runtime_checkable"
         )
+
+
+# --- Conformidade dos executores reais do Marco 5 ---------------------------------------
+#
+# `engine`/`client` "preguiçosos": não abrem conexão nenhuma até o primeiro uso, então
+# este teste roda sem Docker e sem rede — só confere forma, não comportamento (isso é
+# `tests/adapters/executors/test_postgres_integration.py` e `test_elasticsearch_integration.py`).
+
+
+def _real_query_executors():
+    engine = create_async_engine("postgresql+psycopg://user:pass@localhost/db")
+    client = AsyncElasticsearch(hosts=["http://localhost:9200"])
+    return [SQLAlchemyQueryExecutor(engine=engine), ElasticsearchQueryExecutor(client=client)]
+
+
+@pytest.mark.parametrize(
+    "impl", _real_query_executors(), ids=lambda impl: type(impl).__name__
+)
+def test_executor_real_satisfaz_o_protocol(impl):
+    assert isinstance(impl, QueryExecutor)
+
+
+@pytest.mark.parametrize(
+    "impl", _real_query_executors(), ids=lambda impl: type(impl).__name__
+)
+def test_executor_real_tem_a_mesma_assinatura_do_port(impl):
+    for method_name in ("execute", "estimate_cost"):
+        _assert_signature_matches(QueryExecutor, method_name, impl)
 
 
 # --- QueryCost ---------------------------------------------------------------------------
