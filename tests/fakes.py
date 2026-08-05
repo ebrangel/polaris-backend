@@ -132,8 +132,10 @@ class InMemoryJobQueue:
 
     def __init__(self) -> None:
         self._jobs: dict[str, QueryResult] = {}
+        self.calls: list[tuple[QueryRequest, str]] = []
 
     async def enqueue(self, request: QueryRequest, dataset_name: str) -> QueryResult:
+        self.calls.append((request, dataset_name))
         result = QueryResult.processing(request.query_id)
         self._jobs[request.query_id] = result
         return result

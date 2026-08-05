@@ -106,7 +106,10 @@ def test_todos_os_ports_sao_runtime_checkable():
 def _real_query_executors():
     engine = create_async_engine("postgresql+psycopg://user:pass@localhost/db")
     client = AsyncElasticsearch(hosts=["http://localhost:9200"])
-    return [SQLAlchemyQueryExecutor(engine=engine), ElasticsearchQueryExecutor(client=client)]
+    return [
+        SQLAlchemyQueryExecutor(light_engine=engine, heavy_engine=engine),
+        ElasticsearchQueryExecutor(client=client),
+    ]
 
 
 @pytest.mark.parametrize(

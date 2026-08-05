@@ -2,5 +2,6 @@
 
 from application.use_cases.execute_query import ExecuteQuery
 from application.use_cases.resolve_dataset import ResolveDataset
+from application.use_cases.run_queued_query import RunQueuedQuery
 
-__all__ = ["ExecuteQuery", "ResolveDataset"]
+__all__ = ["ExecuteQuery", "ResolveDataset", "RunQueuedQuery"]

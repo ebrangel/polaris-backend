@@ -104,6 +104,7 @@ def test_no_dataset_available_422_com_o_exemplo_da_secao_2_5(executor, cache, jo
         resolve_dataset=ResolveDataset(),
         executors={DatasourceType.POSTGRES: executor, DatasourceType.ORACLE: executor},
         cache=cache,
+        job_queue=job_queue,
     )
     client = TestClient(
         create_app(catalog=catalog, execute_query=execute_query, job_queue=job_queue)

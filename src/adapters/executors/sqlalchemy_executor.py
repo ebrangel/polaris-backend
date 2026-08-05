@@ -1,9 +1,10 @@
 """`SQLAlchemyQueryExecutor` — implementa `QueryExecutor` (Marco 2) para Postgres e
 Oracle via SQLAlchemy Core assíncrono.
 
-Um `AsyncEngine` por instância: a separação de pools leve/pesado por `ExecutionProfile`
-é trabalho do Marco 7 — aqui `profile` é aceito para satisfazer o contrato do port, mas
-ainda não roteia para engines diferentes.
+Dois `AsyncEngine`, sem default: `docs/escalabilidade.md` é explícito — "nunca
+compartilhar o mesmo pool ... entre perfis leve/pesado" — e um default silencioso
+violaria isso sem avisar. O caminho síncrono da API usa `light_engine`; o worker da
+fila (`RunQueuedQuery`, Marco 7) usa `heavy_engine`.
 """
 
 import asyncio
@@ -14,15 +15,30 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from adapters.executors.sql_builder import build_select
 from application.ports.query_executor import ExecutionProfile, QueryCost
 from domain.errors import QueryTimeoutError
-from domain.models import Column, Dataset, QueryRequest, QueryResult
+from domain.models import Column, DataType, Dataset, QueryRequest, QueryResult
 
 
 class SQLAlchemyQueryExecutor:
     """Executa `QueryRequest` já resolvidas contra Postgres/Oracle via SQLAlchemy Core."""
 
-    def __init__(self, engine: AsyncEngine, timeout_seconds: float = 5.0) -> None:
-        self._engine = engine
-        self._timeout_seconds = timeout_seconds
+    def __init__(
+        self,
+        light_engine: AsyncEngine,
+        heavy_engine: AsyncEngine,
+        light_timeout_seconds: float = 5.0,
+        heavy_timeout_seconds: float = 300.0,
+        cost_threshold: float = 10_000.0,
+    ) -> None:
+        self._light_engine = light_engine
+        self._heavy_engine = heavy_engine
+        self._light_timeout_seconds = light_timeout_seconds
+        self._heavy_timeout_seconds = heavy_timeout_seconds
+        self._cost_threshold = cost_threshold
+
+    def _engine_and_timeout(self, profile: ExecutionProfile) -> tuple[AsyncEngine, float]:
+        if profile is ExecutionProfile.HEAVY:
+            return self._heavy_engine, self._heavy_timeout_seconds
+        return self._light_engine, self._light_timeout_seconds
 
     async def execute(
         self,
@@ -32,17 +48,16 @@ class SQLAlchemyQueryExecutor:
         profile: ExecutionProfile = ExecutionProfile.LIGHT,
     ) -> QueryResult:
         stmt = build_select(dataset, request, columns)
+        engine, timeout_seconds = self._engine_and_timeout(profile)
 
         started = time.perf_counter()
         try:
-            async with self._engine.connect() as conn:
-                result = await asyncio.wait_for(
-                    conn.execute(stmt), timeout=self._timeout_seconds
-                )
+            async with engine.connect() as conn:
+                result = await asyncio.wait_for(conn.execute(stmt), timeout=timeout_seconds)
                 rows = result.all()
         except TimeoutError as exc:
             raise QueryTimeoutError(
-                f"A consulta ao dataset '{dataset.name}' excedeu {self._timeout_seconds}s."
+                f"A consulta ao dataset '{dataset.name}' excedeu {timeout_seconds}s."
             ) from exc
         execution_ms = round((time.perf_counter() - started) * 1000)
 
@@ -55,15 +70,58 @@ class SQLAlchemyQueryExecutor:
         )
 
     async def estimate_cost(self, dataset: Dataset, request: QueryRequest) -> QueryCost:
-        """Heurística provisória: mais dimensões pedidas eleva o score, filtro reduz.
-
-        `EXPLAIN`-based de verdade é trabalho do Marco 7 ("quando o datasource
-        suportar" — `docs/escalabilidade.md`); aqui só satisfaz o contrato do port para
-        que o `ExecuteQuery` já possa ser ligado a um executor real.
+        """`EXPLAIN (FORMAT JSON)` no Postgres; heurística por contagem de campos em
+        qualquer outro caso — dialeto diferente (Oracle), erro ao rodar o `EXPLAIN`, ou
+        formato de plano inesperado. Estimar custo nunca pode derrubar uma consulta que
+        funcionaria, por isso a captura é ampla e sempre cai para um resultado válido.
         """
+        if self._light_engine.dialect.name == "postgresql":
+            explained = await self._explain_postgres(dataset, request)
+            if explained is not None:
+                return explained
+
         score = len(request.dimensions) * 10 - len(request.filters) * 5
         return QueryCost(
             score=max(score, 0),
-            threshold=50,
-            detail="heurística por contagem de campos — refinada no Marco 7",
+            threshold=self._cost_threshold,
+            detail="heurística por contagem de campos (Oracle/Elasticsearch, ou EXPLAIN indisponível)",
         )
+
+    async def _explain_postgres(
+        self, dataset: Dataset, request: QueryRequest
+    ) -> QueryCost | None:
+        try:
+            columns = _probe_columns(dataset, request)
+            stmt = build_select(dataset, request, columns)
+            sql = str(stmt.compile(dialect=self._light_engine.dialect, compile_kwargs={"literal_binds": True}))
+
+            async with self._light_engine.connect() as conn:
+                result = await asyncio.wait_for(
+                    conn.exec_driver_sql(f"EXPLAIN (FORMAT JSON) {sql}"),
+                    timeout=self._light_timeout_seconds,
+                )
+                plan = result.scalar_one()
+
+            total_cost = float(plan[0]["Plan"]["Total Cost"])
+        except Exception:
+            # Inclui timeout do EXPLAIN, SQL sem suporte a literal_binds, permissão,
+            # formato de plano inesperado — tudo cai na heurística, silenciosamente.
+            return None
+
+        return QueryCost(
+            score=total_cost,
+            threshold=self._cost_threshold,
+            detail=f"EXPLAIN (FORMAT JSON): Total Cost = {total_cost}",
+        )
+
+
+def _probe_columns(dataset: Dataset, request: QueryRequest) -> tuple[Column, ...]:
+    """`estimate_cost` não recebe `columns` (o port só passa `dataset`/`request`) —
+    mas `build_select` precisa de uma projeção para montar o `Select`. Para o `EXPLAIN`,
+    o que é projetado não importa (só o plano é lido, nunca uma linha), então usa os
+    próprios nomes de `request` como `Column`s "cegas" de tipo `string`.
+    """
+    return tuple(
+        Column(field=name, type=DataType.STRING)
+        for name in (*request.dimensions, *request.measures)
+    )

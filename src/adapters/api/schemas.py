@@ -10,13 +10,11 @@ chaves ausentes (`format` só aparece na coluna que tem um) — controle explíc
 simples que configurar exclusão de nulos em modelos aninhados.
 """
 
-from datetime import date, datetime, time
-from decimal import Decimal
 from typing import Any
-from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from adapters.serialization import jsonable
 from domain.models import (
     Filter,
     FilterOperator,
@@ -87,28 +85,6 @@ def poll_url_for(query_id: str) -> str:
     return f"/v1/query/{query_id}"
 
 
-def _jsonable(value: Any) -> Any:
-    """Valor vindo do driver → tipo serializável em JSON.
-
-    Necessário porque os routers devolvem `JSONResponse` já montada (para controlar o
-    código HTTP: 200 vs. 202 vs. os da seção 2.5), o que passa ao largo da serialização
-    automática do FastAPI. Sem isto, uma coluna `numeric` (→ `Decimal`) ou `date` do
-    Postgres derrubaria a resposta com `TypeError`.
-
-    `Decimal` vira `str`, não `float`: converter para float perderia precisão
-    justamente nas colunas em que ela foi pedida explicitamente no banco.
-    """
-    if isinstance(value, Decimal):
-        return str(value)
-    if isinstance(value, (datetime, date, time)):
-        return value.isoformat()
-    if isinstance(value, UUID):
-        return str(value)
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return value
-
-
 def present_result(result: QueryResult) -> dict[str, Any]:
     """`QueryResult` → corpo da seção 2.3 (concluído/falho) ou 2.4 (em processamento)."""
     if result.status is QueryStatus.PROCESSING:
@@ -137,7 +113,11 @@ def present_result(result: QueryResult) -> dict[str, Any]:
         "query_id": result.query_id,
         "status": result.status.value,
         "columns": columns,
-        "rows": [[_jsonable(value) for value in row] for row in result.rows],
+        # Os routers devolvem `JSONResponse` já montada (para controlar 200 vs. 202 vs.
+        # os códigos da seção 2.5), o que passa ao largo da serialização automática do
+        # FastAPI — sem isto, uma coluna `numeric`/`date` do Postgres (→ `Decimal`/
+        # `date`) derrubaria a resposta com `TypeError`.
+        "rows": [[jsonable(value) for value in row] for row in result.rows],
         "meta": {
             "row_count": result.meta.row_count,
             "cached": result.meta.cached,

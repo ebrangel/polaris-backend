@@ -1,6 +1,6 @@
-"""`ExecuteQuery` — o fluxo completo da seção 3, só o caminho síncrono: validar,
-autorizar, aplicar o teto de `limit`, checar o cache, resolver o dataset, executar,
-cachear. Custo estimado e fila (Marco 7) ficam de fora, de propósito.
+"""`ExecuteQuery` — o fluxo completo da seção 3: validar, autorizar, aplicar o teto de
+`limit`, checar o cache, resolver o dataset, estimar custo (enfileirar se pesada —
+seção 2.4), executar, cachear.
 """
 
 import dataclasses
@@ -8,6 +8,7 @@ import dataclasses
 import pytest
 from fixtures import catalog, eventos_schema, vendas_schema, vendas_schema_com_canal
 
+from application.ports.query_executor import QueryCost
 from application.use_cases import ExecuteQuery, ResolveDataset
 from domain.errors import (
     ForbiddenMeasureError,
@@ -26,15 +27,16 @@ from domain.models import (
     QueryResult,
     QueryStatus,
 )
-from fakes import InMemoryCacheGateway, StubQueryExecutor
+from fakes import InMemoryCacheGateway, InMemoryJobQueue, StubQueryExecutor
 
 
-def make_execute_query(cat, *, executors=None, cache=None):
+def make_execute_query(cat, *, executors=None, cache=None, job_queue=None):
     return ExecuteQuery(
         catalog=cat,
         resolve_dataset=ResolveDataset(),
         executors=executors if executors is not None else {},
         cache=cache if cache is not None else InMemoryCacheGateway(),
+        job_queue=job_queue if job_queue is not None else InMemoryJobQueue(),
     )
 
 
@@ -177,6 +179,74 @@ async def test_executor_nao_configurado_levanta_lookup_error():
 
     with pytest.raises(LookupError, match="vendas_agregado_uf"):
         await execute(request, roles=[])
+
+
+# --- Custo estimado e fila (seção 2.4) --------------------------------------------------
+
+
+async def test_consulta_pesada_enfileira_sem_executar_nem_cachear():
+    heavy_cost = QueryCost(score=100, threshold=50)
+    stub = StubQueryExecutor(cost=heavy_cost)
+    cache = InMemoryCacheGateway()
+    job_queue = InMemoryJobQueue()
+    execute = make_execute_query(
+        Catalog(schemas={"vendas": vendas_schema()}),
+        executors={DatasourceType.POSTGRES: stub},
+        cache=cache,
+        job_queue=job_queue,
+    )
+    request = QueryRequest(schema="vendas", dimensions=("sigla_uf",), measures=("valor_total",))
+
+    result = await execute(request, roles=["financeiro"])
+
+    assert result.status is QueryStatus.PROCESSING
+    assert result.query_id == request.query_id
+    assert stub.calls == []  # `execute()` nunca foi chamado
+    assert await cache.get(request.query_id) is None  # nada cacheado
+    assert job_queue.calls == [(request, "vendas_agregado_uf")]  # dataset.name correto
+
+
+async def test_consulta_leve_nao_enfileira():
+    light_cost = QueryCost(score=1, threshold=50)
+    job_queue = InMemoryJobQueue()
+    execute = make_execute_query(
+        Catalog(schemas={"vendas": vendas_schema()}),
+        executors={DatasourceType.POSTGRES: StubQueryExecutor(cost=light_cost)},
+        job_queue=job_queue,
+    )
+    request = QueryRequest(schema="vendas", dimensions=("sigla_uf",), measures=("valor_total",))
+
+    result = await execute(request, roles=["financeiro"])
+
+    assert result.status is QueryStatus.COMPLETED
+    assert job_queue.calls == []
+
+
+async def test_cache_hit_nao_chega_a_estimar_custo():
+    """A ordem importa (seção 2.4: "depois de resolver o dataset, estimar custo"): o
+    cache é checado antes, então um acerto não deveria nem chegar lá. Prova indireta:
+    se a estimativa rodasse no segundo `execute`, o `cost` (mutado para pesado depois
+    do primeiro request) faria a consulta ser enfileirada em vez de vir do cache."""
+    stub = StubQueryExecutor()
+    cache = InMemoryCacheGateway()
+    job_queue = InMemoryJobQueue()
+    execute = make_execute_query(
+        Catalog(schemas={"vendas": vendas_schema()}),
+        executors={DatasourceType.POSTGRES: stub},
+        cache=cache,
+        job_queue=job_queue,
+    )
+    request = QueryRequest(schema="vendas", dimensions=("sigla_uf",), measures=("valor_total",))
+
+    first = await execute(request, roles=["financeiro"])
+    assert first.status is QueryStatus.COMPLETED
+
+    stub.cost = QueryCost(score=100, threshold=50)  # a partir daqui, "pesada"
+    second = await execute(request, roles=["financeiro"])
+
+    assert second.status is QueryStatus.COMPLETED
+    assert second.meta.cached is True
+    assert job_queue.calls == []
 
 
 # --- Teto de limit por schema (seção 2.6) -----------------------------------------------

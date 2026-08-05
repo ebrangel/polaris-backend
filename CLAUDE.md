@@ -40,7 +40,7 @@ src/
     repositories/        # PostgresCatalogRepository
     executors/            # SQLAlchemyQueryExecutor (Postgres/Oracle), ElasticsearchQueryExecutor
     cache/                # RedisCacheGateway
-    queue/                # CeleryJobQueue
+    queue/                # ArqJobQueue
 
   infrastructure/        # Frameworks & drivers — composition root
     db/                    # engines SQLAlchemy por datasource
@@ -120,7 +120,7 @@ Trabalhar um marco por vez; cada um deve ser testável e revisável isoladamente
 - Formato de erro padronizado (seção 2.5)
 
 ### Marco 7 — Adapters: cache e fila
-- `RedisCacheGateway` (implementa `CacheGateway`) e `CeleryJobQueue` (implementa `JobQueue`)
+- `RedisCacheGateway` (implementa `CacheGateway`) e `ArqJobQueue` (implementa `JobQueue`) — `arq` no lugar de Celery: é async-nativo sobre Redis, o que evita pontes `asyncio.to_thread` num port inteiramente `async def` (convenção de assincronia, acima); `docs/escalabilidade.md` já admite "Celery+Redis ou RQ" como alternativas equivalentes
 - Critério de decisão leve/pesada (custo estimado da consulta, calculado por datasource) dentro do use case `ExecuteQuery`, delegando ao `JobQueue` quando pesada
 - Pool de conexões dedicado por datasource nos executores (Marco 5)
 

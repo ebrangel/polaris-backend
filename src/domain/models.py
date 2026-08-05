@@ -902,6 +902,20 @@ class Schema:
         ]
         return tuple(columns)
 
+    def get_dataset(self, name: str) -> Dataset:
+        """Um dos `datasets` do schema, pelo nome.
+
+        Usado pelo worker da fila (Marco 7): o job carrega o **nome** do dataset já
+        escolhido por `ResolveDataset` no momento do enfileiramento (seção 2.4), então o
+        worker não resolve de novo — só busca. `LookupError`, não `DomainError`: um nome
+        ausente aqui é publicação de catálogo incompatível com um job antigo na fila, não
+        erro de cliente.
+        """
+        for dataset in self.datasets:
+            if dataset.name == name:
+                return dataset
+        raise LookupError(f"Dataset '{name}' não existe no schema '{self.name}'.")
+
 
 # --------------------------------------------------------------------------------------
 # Catálogo em memória

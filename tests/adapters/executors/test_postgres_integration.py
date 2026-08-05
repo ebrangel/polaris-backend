@@ -175,7 +175,7 @@ async def test_modelo_plano_com_filtro_e_ordenacao_da_secao_2_2(pg_engine):
     """A requisição da seção 2.2, executada de verdade."""
     schema = vendas_schema()
     dataset = vendas_agregado_uf()
-    executor = SQLAlchemyQueryExecutor(engine=pg_engine)
+    executor = SQLAlchemyQueryExecutor(light_engine=pg_engine, heavy_engine=pg_engine)
     request = QueryRequest(
         schema="vendas",
         dimensions=("sigla_uf",),
@@ -196,7 +196,7 @@ async def test_modelo_plano_com_filtro_e_ordenacao_da_secao_2_2(pg_engine):
 async def test_limit_e_offset_reais(pg_engine):
     schema = vendas_schema()
     dataset = vendas_agregado_uf()
-    executor = SQLAlchemyQueryExecutor(engine=pg_engine)
+    executor = SQLAlchemyQueryExecutor(light_engine=pg_engine, heavy_engine=pg_engine)
     request = QueryRequest(
         schema="vendas",
         dimensions=("sigla_uf",),
@@ -214,7 +214,7 @@ async def test_limit_e_offset_reais(pg_engine):
 
 async def test_star_schema_com_join_real(pg_engine):
     dataset = _vendas_detalhado_postgres()
-    executor = SQLAlchemyQueryExecutor(engine=pg_engine)
+    executor = SQLAlchemyQueryExecutor(light_engine=pg_engine, heavy_engine=pg_engine)
     request = QueryRequest(
         schema="vendas",
         dimensions=("sigla_uf", "cargo"),
@@ -238,7 +238,7 @@ async def test_star_schema_com_join_real(pg_engine):
 
 
 async def test_timeout_real_vira_query_timeout_error(pg_engine):
-    executor = SQLAlchemyQueryExecutor(engine=pg_engine, timeout_seconds=0.5)
+    executor = SQLAlchemyQueryExecutor(light_engine=pg_engine, heavy_engine=pg_engine, light_timeout_seconds=0.5)
     dataset = _slow_dataset()
     request = QueryRequest(schema="vendas", dimensions=("uf",), measures=("valor_total",))
     columns = (

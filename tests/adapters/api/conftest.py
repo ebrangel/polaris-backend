@@ -47,6 +47,7 @@ def client(catalog, executor, cache, job_queue) -> TestClient:
             DatasourceType.ELASTICSEARCH: executor,
         },
         cache=cache,
+        job_queue=job_queue,
     )
     app = create_app(catalog=catalog, execute_query=execute_query, job_queue=job_queue)
     return TestClient(app)
