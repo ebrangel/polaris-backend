@@ -1,0 +1,181 @@
+"""Modelos Pydantic da borda HTTP + tradução para/de entidades de domínio.
+
+Entrada: JSON (seção 2.2) → `QueryRequestModel` → `QueryRequest` (domain). O `POST` e a
+opção A do `GET` (seção 2.2a, `query=<json>`) usam **este mesmo modelo** — é o que o
+documento chama de "validado pelo mesmo modelo Pydantic — zero lógica de parsing nova".
+
+Saída: `QueryResult` (domain) → dicionários no formato das seções 2.3 e 2.4. As
+respostas são montadas à mão, e não por `response_model`, porque o contrato omite
+chaves ausentes (`format` só aparece na coluna que tem um) — controle explícito é mais
+simples que configurar exclusão de nulos em modelos aninhados.
+"""
+
+from datetime import date, datetime, time
+from decimal import Decimal
+from typing import Any
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from domain.models import (
+    Filter,
+    FilterOperator,
+    OrderBy,
+    QueryRequest,
+    QueryResult,
+    QueryStatus,
+    Schema,
+    SortDirection,
+)
+
+
+class FilterModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    field: str
+    operator: FilterOperator
+    value: Any
+
+
+class OrderByModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    field: str
+    direction: SortDirection = SortDirection.ASC
+
+
+class QueryRequestModel(BaseModel):
+    """Corpo da seção 2.2.
+
+    O campo se chama `schema` no fio (é o contrato), mas o atributo Python é
+    `schema_name`: `schema` sombrearia `BaseModel.schema()` e o Pydantic emite aviso.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    schema_name: str = Field(alias="schema")
+    dimensions: list[str] = Field(default_factory=list)
+    measures: list[str] = Field(default_factory=list)
+    filters: list[FilterModel] = Field(default_factory=list)
+    order_by: list[OrderByModel] = Field(default_factory=list)
+    limit: int | None = None
+    offset: int = 0
+
+    def to_domain(self) -> QueryRequest:
+        """Converte para a entidade de domínio — o ponto de convergência de POST e GET.
+
+        As invariantes (operador `in` com lista vazia, `limit` negativo, ...) são
+        verificadas pelo próprio domínio na construção e sobem como `DomainError`.
+        """
+        return QueryRequest(
+            schema=self.schema_name,
+            dimensions=tuple(self.dimensions),
+            measures=tuple(self.measures),
+            filters=tuple(
+                Filter(field=f.field, operator=f.operator, value=f.value)
+                for f in self.filters
+            ),
+            order_by=tuple(
+                OrderBy(field=o.field, direction=o.direction) for o in self.order_by
+            ),
+            limit=self.limit,
+            offset=self.offset,
+        )
+
+
+def poll_url_for(query_id: str) -> str:
+    return f"/v1/query/{query_id}"
+
+
+def _jsonable(value: Any) -> Any:
+    """Valor vindo do driver → tipo serializável em JSON.
+
+    Necessário porque os routers devolvem `JSONResponse` já montada (para controlar o
+    código HTTP: 200 vs. 202 vs. os da seção 2.5), o que passa ao largo da serialização
+    automática do FastAPI. Sem isto, uma coluna `numeric` (→ `Decimal`) ou `date` do
+    Postgres derrubaria a resposta com `TypeError`.
+
+    `Decimal` vira `str`, não `float`: converter para float perderia precisão
+    justamente nas colunas em que ela foi pedida explicitamente no banco.
+    """
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def present_result(result: QueryResult) -> dict[str, Any]:
+    """`QueryResult` → corpo da seção 2.3 (concluído/falho) ou 2.4 (em processamento)."""
+    if result.status is QueryStatus.PROCESSING:
+        return {
+            "query_id": result.query_id,
+            "status": result.status.value,
+            "poll_url": poll_url_for(result.query_id),
+        }
+
+    if result.status is QueryStatus.FAILED:
+        return {
+            "query_id": result.query_id,
+            "status": result.status.value,
+            "error": result.error,
+        }
+
+    columns = []
+    for column in result.columns:
+        item: dict[str, Any] = {"field": column.field, "type": column.type.value}
+        if column.format is not None:
+            item["format"] = column.format
+        columns.append(item)
+
+    assert result.meta is not None  # garantido pelas invariantes de QueryResult
+    return {
+        "query_id": result.query_id,
+        "status": result.status.value,
+        "columns": columns,
+        "rows": [[_jsonable(value) for value in row] for row in result.rows],
+        "meta": {
+            "row_count": result.meta.row_count,
+            "cached": result.meta.cached,
+            "execution_ms": result.meta.execution_ms,
+            "dataset_used": result.meta.dataset_used,
+        },
+    }
+
+
+def present_schema_summary(schema: Schema) -> dict[str, Any]:
+    """Item de `GET /v1/catalog` — só nome e descrição."""
+    summary: dict[str, Any] = {"schema": schema.name, "version": schema.version}
+    if schema.description is not None:
+        summary["description"] = schema.description
+    return summary
+
+
+def present_schema_detail(schema: Schema) -> dict[str, Any]:
+    """Corpo de `GET /v1/catalog/{schema}` — **só o modelo lógico**.
+
+    "A resposta desse endpoint mostra apenas o modelo lógico (dimensões/medidas) — os
+    datasets e seu roteamento são detalhe interno, não expostos ao cliente" (seção 2.1).
+    A tabela de endpoints da mesma seção diz o contrário ("...e datasets"); seguimos a
+    prosa, que é a que casa com a convenção do CLAUDE.md de que o cliente não conhece a
+    estrutura física.
+    """
+    detail = present_schema_summary(schema)
+    detail["dimensions"] = [
+        {"name": dim.name, "type": dim.type.value, "filterable": dim.filterable}
+        for dim in schema.dimensions.values()
+    ]
+
+    measures = []
+    for measure in schema.measures.values():
+        item: dict[str, Any] = {"name": measure.name, "agg": measure.agg.value}
+        if measure.format is not None:
+            item["format"] = measure.format
+        measures.append(item)
+    detail["measures"] = measures
+
+    return detail
