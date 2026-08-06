@@ -20,7 +20,6 @@ from domain.errors import (
 )
 from domain.models import (
     Catalog,
-    DatasourceType,
     Filter,
     FilterOperator,
     QueryRequest,
@@ -47,7 +46,7 @@ async def test_caminho_feliz_da_secao_2_2_devolve_o_formato_da_secao_2_3():
     schema = vendas_schema()
     stub = StubQueryExecutor()
     execute = make_execute_query(
-        Catalog(schemas={"vendas": schema}), executors={DatasourceType.POSTGRES: stub}
+        Catalog(schemas={"vendas": schema}), executors={"env:DW_VENDAS_PG_URL": stub}
     )
     request = QueryRequest(
         schema="vendas",
@@ -72,7 +71,7 @@ async def test_eventos_navegacao_resolve_para_o_dataset_elasticsearch():
     stub = StubQueryExecutor()
     execute = make_execute_query(
         Catalog(schemas={"eventos_navegacao": eventos_schema()}),
-        executors={DatasourceType.ELASTICSEARCH: stub},
+        executors={"env:ES_EVENTOS_URL": stub},
     )
     request = QueryRequest(
         schema="eventos_navegacao", dimensions=("pais",), measures=("duracao_media",)
@@ -92,7 +91,7 @@ async def test_cache_miss_grava_e_cache_hit_nao_executa_de_novo():
     cache = InMemoryCacheGateway()
     execute = make_execute_query(
         Catalog(schemas={"vendas": vendas_schema()}),
-        executors={DatasourceType.POSTGRES: stub},
+        executors={"env:DW_VENDAS_PG_URL": stub},
         cache=cache,
     )
     request = QueryRequest(schema="vendas", dimensions=("sigla_uf",), measures=("valor_total",))
@@ -118,7 +117,7 @@ async def test_resultado_failed_nao_e_cacheado():
     cache = InMemoryCacheGateway()
     execute = make_execute_query(
         Catalog(schemas={"vendas": schema}),
-        executors={DatasourceType.POSTGRES: stub},
+        executors={"env:DW_VENDAS_PG_URL": stub},
         cache=cache,
     )
 
@@ -135,7 +134,7 @@ async def test_erro_do_executor_propaga_e_nao_e_cacheado():
     cache = InMemoryCacheGateway()
     execute = make_execute_query(
         Catalog(schemas={"vendas": schema}),
-        executors={DatasourceType.POSTGRES: stub},
+        executors={"env:DW_VENDAS_PG_URL": stub},
         cache=cache,
     )
 
@@ -156,8 +155,8 @@ async def test_roteamento_por_datasource_segue_o_dataset_resolvido():
     execute = make_execute_query(
         Catalog(schemas={"vendas": vendas_schema()}),
         executors={
-            DatasourceType.POSTGRES: postgres_stub,
-            DatasourceType.ORACLE: oracle_stub,
+            "env:DW_VENDAS_PG_URL": postgres_stub,
+            "env:DW_VENDAS_ORACLE_URL": oracle_stub,
         },
     )
 
@@ -191,7 +190,7 @@ async def test_consulta_pesada_enfileira_sem_executar_nem_cachear():
     job_queue = InMemoryJobQueue()
     execute = make_execute_query(
         Catalog(schemas={"vendas": vendas_schema()}),
-        executors={DatasourceType.POSTGRES: stub},
+        executors={"env:DW_VENDAS_PG_URL": stub},
         cache=cache,
         job_queue=job_queue,
     )
@@ -211,7 +210,7 @@ async def test_consulta_leve_nao_enfileira():
     job_queue = InMemoryJobQueue()
     execute = make_execute_query(
         Catalog(schemas={"vendas": vendas_schema()}),
-        executors={DatasourceType.POSTGRES: StubQueryExecutor(cost=light_cost)},
+        executors={"env:DW_VENDAS_PG_URL": StubQueryExecutor(cost=light_cost)},
         job_queue=job_queue,
     )
     request = QueryRequest(schema="vendas", dimensions=("sigla_uf",), measures=("valor_total",))
@@ -232,7 +231,7 @@ async def test_cache_hit_nao_chega_a_estimar_custo():
     job_queue = InMemoryJobQueue()
     execute = make_execute_query(
         Catalog(schemas={"vendas": vendas_schema()}),
-        executors={DatasourceType.POSTGRES: stub},
+        executors={"env:DW_VENDAS_PG_URL": stub},
         cache=cache,
         job_queue=job_queue,
     )
@@ -258,7 +257,7 @@ async def test_teto_de_limit_por_schema_e_aplicado_e_compartilha_cache():
     cache = InMemoryCacheGateway()
     execute = make_execute_query(
         Catalog(schemas={"vendas": schema}),
-        executors={DatasourceType.POSTGRES: stub},
+        executors={"env:DW_VENDAS_PG_URL": stub},
         cache=cache,
     )
 

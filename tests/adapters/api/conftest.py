@@ -10,8 +10,17 @@ from fixtures import catalog as catalog_fixture
 
 from adapters.api import create_app
 from application.use_cases import ExecuteQuery, ResolveDataset
-from domain.models import Catalog, DatasourceType
+from domain.models import Catalog
 from fakes import InMemoryCacheGateway, InMemoryJobQueue, StubQueryExecutor
+
+#: Os quatro `connection_ref` distintos do catálogo de `catalog()` (vendas tem dois
+#: Postgres diferentes — seções 1.0 e 1.2 — daí não dar para chavear por engine).
+_ALL_CONNECTION_REFS = (
+    "env:DW_VENDAS_PG_URL",
+    "env:DW_VENDAS_ORACLE_URL",
+    "env:ES_EVENTOS_URL",
+    "env:APP_ESTOQUE_URL",
+)
 
 
 @pytest.fixture
@@ -41,11 +50,7 @@ def client(catalog, executor, cache, job_queue) -> TestClient:
     execute_query = ExecuteQuery(
         catalog=catalog,
         resolve_dataset=ResolveDataset(),
-        executors={
-            DatasourceType.POSTGRES: executor,
-            DatasourceType.ORACLE: executor,
-            DatasourceType.ELASTICSEARCH: executor,
-        },
+        executors=dict.fromkeys(_ALL_CONNECTION_REFS, executor),
         cache=cache,
         job_queue=job_queue,
     )

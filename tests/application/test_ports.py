@@ -11,16 +11,21 @@ from fixtures import vendas_agregado_uf, vendas_schema
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from adapters.executors import ElasticsearchQueryExecutor, SQLAlchemyQueryExecutor
+from application.catalog_codec import canonical_json, schema_to_dict
 from application.ports.cache_gateway import CacheGateway
+from application.ports.catalog_invalidator import CatalogInvalidator
 from application.ports.catalog_repository import CatalogRepository
+from application.ports.datasource_inspector import DatasourceInspector
 from application.ports.job_queue import JobQueue
 from application.ports.query_executor import ExecutionProfile, QueryCost, QueryExecutor
 from domain.errors import QueryTimeoutError
 from domain.models import QueryRequest, QueryResult
 from fakes import (
     InMemoryCacheGateway,
+    InMemoryCatalogInvalidator,
     InMemoryCatalogRepository,
     InMemoryJobQueue,
+    StubDatasourceInspector,
     StubQueryExecutor,
 )
 
@@ -35,6 +40,8 @@ PORT_METHODS = {
     QueryExecutor: (StubQueryExecutor, ("execute", "estimate_cost")),
     CacheGateway: (InMemoryCacheGateway, ("get", "set", "delete")),
     JobQueue: (InMemoryJobQueue, ("enqueue", "get_status", "depth")),
+    DatasourceInspector: (StubDatasourceInspector, ("missing_fields",)),
+    CatalogInvalidator: (InMemoryCatalogInvalidator, ("publish",)),
 }
 
 
@@ -232,17 +239,17 @@ async def test_catalog_repository_get_active_version_de_schema_desconhecido():
 async def test_catalog_repository_publish_new_version():
     repo = InMemoryCatalogRepository()
     schema = vendas_schema()
-    repo.register(schema)
+    content = canonical_json(schema_to_dict(schema))
 
     version = await repo.publish_new_version(
         schema_name="vendas",
-        content="{}",
+        content=content,
         content_hash="abc123",
         git_sha="deadbeef",
         published_by="pipeline",
     )
 
-    assert version.schema is schema
+    assert version.schema == schema
     assert version.is_active
     assert version.published_by == "pipeline"
     assert (await repo.get_active_version("vendas")) == version
@@ -253,11 +260,10 @@ async def test_catalog_repository_nova_publicacao_desativa_a_anterior():
     """"Cada publicação insere uma nova linha (nunca UPDATE); a anterior é desativada
     na mesma transação" — `docs/pipeline-publicacao.md`."""
     repo = InMemoryCatalogRepository()
-    schema = vendas_schema()
-    repo.register(schema)
+    content = canonical_json(schema_to_dict(vendas_schema()))
 
-    first = await repo.publish_new_version("vendas", "{}", "hash1", "sha1")
-    second = await repo.publish_new_version("vendas", "{}", "hash2", "sha2")
+    first = await repo.publish_new_version("vendas", content, "hash1", "sha1")
+    second = await repo.publish_new_version("vendas", content, "hash2", "sha2")
 
     assert (await repo.get_active_version("vendas")) == second
     assert repo.history("vendas") == (first, second)

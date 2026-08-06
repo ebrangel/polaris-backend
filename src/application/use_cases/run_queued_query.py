@@ -10,15 +10,13 @@ from collections.abc import Mapping
 
 from application.ports.query_executor import ExecutionProfile, QueryExecutor
 from application.use_cases._executor_lookup import executor_for
-from domain.models import Catalog, DatasourceType, QueryRequest, QueryResult
+from domain.models import Catalog, QueryRequest, QueryResult
 
 
 class RunQueuedQuery:
     """Chamado pelo worker (`adapters/queue/tasks.py`) para cada job que sai da fila."""
 
-    def __init__(
-        self, catalog: Catalog, executors: Mapping[DatasourceType, QueryExecutor]
-    ) -> None:
+    def __init__(self, catalog: Catalog, executors: Mapping[str, QueryExecutor]) -> None:
         self._catalog = catalog
         self._executors = executors
 

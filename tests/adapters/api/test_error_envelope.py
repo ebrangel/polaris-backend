@@ -11,7 +11,7 @@ from fixtures import vendas_schema_com_canal
 from adapters.api import create_app
 from application.use_cases import ExecuteQuery, ResolveDataset
 from domain.errors import QueryTimeoutError
-from domain.models import Catalog, DatasourceType
+from domain.models import Catalog
 
 
 def _erro(response):
@@ -102,7 +102,7 @@ def test_no_dataset_available_422_com_o_exemplo_da_secao_2_5(executor, cache, jo
     execute_query = ExecuteQuery(
         catalog=catalog,
         resolve_dataset=ResolveDataset(),
-        executors={DatasourceType.POSTGRES: executor, DatasourceType.ORACLE: executor},
+        executors={"env:DW_VENDAS_PG_URL": executor, "env:DW_VENDAS_ORACLE_URL": executor},
         cache=cache,
         job_queue=job_queue,
     )

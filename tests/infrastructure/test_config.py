@@ -1,0 +1,94 @@
+"""`infrastructure/config.py` — leitura de env vars e resolução de `connection_ref`.
+
+Único lugar do sistema que lê `os.environ` diretamente; os testes usam
+`monkeypatch.setenv`/`delenv` para isolar cada caso sem tocar no ambiente real.
+"""
+
+import pytest
+
+from infrastructure.config import ConfigError, load_settings, resolve_connection_ref
+
+
+# --- resolve_connection_ref ------------------------------------------------------------
+
+
+def test_resolve_connection_ref_le_a_env_var_referenciada(monkeypatch):
+    monkeypatch.setenv("DW_VENDAS_PG_URL", "postgresql+psycopg://user:pass@host/db")
+
+    assert resolve_connection_ref("env:DW_VENDAS_PG_URL") == (
+        "postgresql+psycopg://user:pass@host/db"
+    )
+
+
+def test_resolve_connection_ref_sem_prefixo_env_levanta_config_error():
+    with pytest.raises(ConfigError, match="env:"):
+        resolve_connection_ref("DW_VENDAS_PG_URL")
+
+
+def test_resolve_connection_ref_com_env_var_ausente_levanta_config_error(monkeypatch):
+    monkeypatch.delenv("VARIAVEL_QUE_NAO_EXISTE", raising=False)
+
+    with pytest.raises(ConfigError, match="VARIAVEL_QUE_NAO_EXISTE"):
+        resolve_connection_ref("env:VARIAVEL_QUE_NAO_EXISTE")
+
+
+# --- load_settings ----------------------------------------------------------------------
+
+
+@pytest.fixture
+def env_obrigatorio(monkeypatch):
+    monkeypatch.setenv("CATALOG_DB_URL", "postgresql+psycopg://user:pass@host/catalogo")
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("INTERNAL_TOKEN", "token-secreto")
+
+
+def test_load_settings_com_env_obrigatorio_preenchido(env_obrigatorio):
+    settings = load_settings()
+
+    assert settings.catalog_db_url == "postgresql+psycopg://user:pass@host/catalogo"
+    assert settings.redis_url == "redis://localhost:6379/0"
+    assert settings.internal_token == "token-secreto"
+    assert settings.git_sha == "unknown"  # default sem GIT_SHA no ambiente
+
+
+@pytest.mark.parametrize(
+    "missing_var", ["CATALOG_DB_URL", "REDIS_URL", "INTERNAL_TOKEN"]
+)
+def test_load_settings_sem_env_obrigatoria_levanta_config_error(
+    env_obrigatorio, monkeypatch, missing_var
+):
+    monkeypatch.delenv(missing_var, raising=False)
+
+    with pytest.raises(ConfigError, match=missing_var):
+        load_settings()
+
+
+def test_load_settings_le_os_opcionais_quando_presentes(env_obrigatorio, monkeypatch):
+    monkeypatch.setenv("GIT_SHA", "cafe1234")
+    monkeypatch.setenv("LIGHT_TIMEOUT_SECONDS", "2.5")
+    monkeypatch.setenv("HEAVY_TIMEOUT_SECONDS", "600")
+    monkeypatch.setenv("COST_THRESHOLD", "5000")
+    monkeypatch.setenv("CACHE_TTL_SECONDS", "60")
+    monkeypatch.setenv("LIGHT_POOL_SIZE", "10")
+    monkeypatch.setenv("HEAVY_POOL_SIZE", "2")
+
+    settings = load_settings()
+
+    assert settings.git_sha == "cafe1234"
+    assert settings.light_timeout_seconds == 2.5
+    assert settings.heavy_timeout_seconds == 600.0
+    assert settings.cost_threshold == 5000.0
+    assert settings.cache_ttl_seconds == 60
+    assert settings.light_pool_size == 10
+    assert settings.heavy_pool_size == 2
+
+
+def test_load_settings_usa_defaults_dos_opcionais_ausentes(env_obrigatorio):
+    settings = load_settings()
+
+    assert settings.light_timeout_seconds == 5.0
+    assert settings.heavy_timeout_seconds == 300.0
+    assert settings.cost_threshold == 10_000.0
+    assert settings.cache_ttl_seconds == 3600
+    assert settings.light_pool_size == 20
+    assert settings.heavy_pool_size == 3

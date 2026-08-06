@@ -13,7 +13,7 @@ from application.ports.job_queue import JobQueue
 from application.ports.query_executor import QueryExecutor
 from application.use_cases._executor_lookup import executor_for
 from application.use_cases.resolve_dataset import ResolveDataset
-from domain.models import Catalog, DatasourceType, QueryRequest, QueryResult, QueryStatus
+from domain.models import Catalog, QueryRequest, QueryResult, QueryStatus
 
 
 class ExecuteQuery:
@@ -25,7 +25,7 @@ class ExecuteQuery:
         self,
         catalog: Catalog,
         resolve_dataset: ResolveDataset,
-        executors: Mapping[DatasourceType, QueryExecutor],
+        executors: Mapping[str, QueryExecutor],
         cache: CacheGateway,
         job_queue: JobQueue,
         cache_ttl_seconds: int | None = None,

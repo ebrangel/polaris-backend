@@ -7,27 +7,19 @@ para testar a orquestração do use case `ExecuteQuery` sem nenhum banco real.
 
 from datetime import UTC, datetime
 
+from application.catalog_codec import decompile_schema
 from application.ports.query_executor import ExecutionProfile, QueryCost
-from domain.models import CatalogVersion, Dataset, QueryRequest, QueryResult, QueryStatus, Schema
+from domain.models import CatalogVersion, Dataset, QueryRequest, QueryResult, QueryStatus
 
 
 class InMemoryCatalogRepository:
-    """Fake do `CatalogRepository`.
-
-    A tradução `content` (JSON compilado) → `Schema` é do adapter e só existe a partir
-    do Marco 8; aqui, `register()` pré-cadastra o `Schema` que `publish_new_version`
-    deve usar para o schema_name informado — o fake guarda fielmente hash, git_sha e
-    quem publicou, só não reimplementa um parser de catálogo.
-    """
+    """Fake do `CatalogRepository`. Desserializa `content` de verdade via
+    `catalog_codec.decompile_schema` (Marco 8) — como qualquer repositório real faria
+    ao ler uma linha de volta; não precisa mais de um `Schema` pré-cadastrado."""
 
     def __init__(self) -> None:
-        self._schemas: dict[str, Schema] = {}
         self._active: dict[str, CatalogVersion] = {}
         self._history: dict[str, list[CatalogVersion]] = {}
-
-    def register(self, schema: Schema) -> None:
-        """Cadastra o `Schema` que será usado nas próximas publicações desse nome."""
-        self._schemas[schema.name] = schema
 
     async def get_active_version(self, schema_name: str) -> CatalogVersion | None:
         return self._active.get(schema_name)
@@ -43,12 +35,8 @@ class InMemoryCatalogRepository:
         git_sha: str,
         published_by: str | None = None,
     ) -> CatalogVersion:
-        if schema_name not in self._schemas:
-            raise KeyError(
-                f"nenhum Schema registrado para '{schema_name}' — chame register() antes"
-            )
         version = CatalogVersion(
-            schema=self._schemas[schema_name],
+            schema=decompile_schema(content),
             content_hash=content_hash,
             git_sha=git_sha,
             published_at=datetime.now(UTC),
@@ -125,6 +113,28 @@ class InMemoryCacheGateway:
 
     async def delete(self, key: str) -> None:
         self._store.pop(key, None)
+
+
+class StubDatasourceInspector:
+    """Fake do `DatasourceInspector`: campos faltantes programáveis por dataset."""
+
+    def __init__(self, missing: dict[str, tuple[str, ...]] | None = None) -> None:
+        self._missing = missing or {}
+        self.calls: list[Dataset] = []
+
+    async def missing_fields(self, dataset: Dataset) -> tuple[str, ...]:
+        self.calls.append(dataset)
+        return self._missing.get(dataset.name, ())
+
+
+class InMemoryCatalogInvalidator:
+    """Fake do `CatalogInvalidator`: registra os schemas invalidados, em ordem."""
+
+    def __init__(self) -> None:
+        self.published: list[str] = []
+
+    async def publish(self, schema_name: str) -> None:
+        self.published.append(schema_name)
 
 
 class InMemoryJobQueue:

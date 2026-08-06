@@ -1,0 +1,69 @@
+version: 1
+schema: vendas
+description: "Vendas — dataset escolhido automaticamente por cobertura de campos"
+
+dimensions:
+  sigla_uf:
+    type: string
+    filterable: true
+  cargo:
+    type: string
+    filterable: true
+
+measures:
+  valor_total:
+    agg: sum
+    format: currency
+  quantidade:
+    agg: sum
+
+access_control:
+  roles:
+    financeiro: [valor_total, quantidade]
+
+datasets:
+  - name: vendas_agregado_uf
+    datasource:
+      type: postgres
+      connection_ref: env:DW_VENDAS_PG_URL
+    provides:
+      dimensions: [sigla_uf]
+      measures: [valor_total, quantidade]
+    table:
+      source: dw.vendas_agregado_uf
+      mapping:
+        sigla_uf: { column: uf }
+        valor_total: { column: vl_total, agg: sum }
+        quantidade: { column: qt_total, agg: sum }
+
+  - name: vendas_detalhado
+    datasource:
+      type: oracle
+      connection_ref: env:DW_VENDAS_ORACLE_URL
+    provides:
+      dimensions: [sigla_uf, cargo]
+      measures: [valor_total, quantidade]
+    fact:
+      table: SCHEMA_DW.FT_VENDAS
+      mapping:
+        valor_total: { column: VL_TOTAL, agg: sum }
+        quantidade: { column: QT_ITEM, agg: sum }
+      keys:
+        cliente_id: { column: CD_CLIENTE, references: dim_cliente.id }
+        cargo_id: { column: CD_CARGO, references: dim_cargo.id }
+    dimensions:
+      dim_cliente:
+        table: SCHEMA_DW.DM_CLIENTE
+        primary_key: CD_CLIENTE
+        mapping:
+          sigla_uf: { column: SG_UF }
+      dim_cargo:
+        table: SCHEMA_DW.DM_CARGO
+        primary_key: CD_CARGO
+        mapping:
+          cargo: { column: DS_CARGO }
+    joins:
+      - from: fato_vendas.cliente_id
+        to: dim_cliente.id
+      - from: fato_vendas.cargo_id
+        to: dim_cargo.id

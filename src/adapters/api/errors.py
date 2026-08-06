@@ -12,10 +12,12 @@ backpressure: 429"). Os demais são escolha deste adapter, anotada abaixo.
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from domain.errors import (
     DomainError,
     ForbiddenMeasureError,
+    InvalidCatalogError,
     InvalidFilterError,
     NoDatasetAvailableError,
     QueryTimeoutError,
@@ -36,6 +38,7 @@ _STATUS_BY_ERROR: dict[type[DomainError], int] = {
     NoDatasetAvailableError: 422,  # documentado na seção 2.5
     QueryTimeoutError: 504,  # a API é o gateway; quem estourou o prazo foi o datasource
     RateLimitedError: 429,  # documentado em docs/escalabilidade.md
+    InvalidCatalogError: 422,  # catálogo bem formado, mas semanticamente inválido (Marco 8)
 }
 
 #: Erros de validação de forma (Pydantic/FastAPI) não são `DomainError`: o corpo nem
@@ -45,6 +48,10 @@ MALFORMED_REQUEST_TYPE = "malformed_request"
 #: `query_id` inexistente em `GET /v1/query/{query_id}`. A lista de `type` da seção 2.5
 #: não cobre este caso — acrescentado aqui, como o `invalid_catalog` do Marco 1.
 UNKNOWN_QUERY_TYPE = "unknown_query"
+
+#: `type` genérico para as poucas rotas (administrativas, Marco 8) que ainda levantam
+#: `HTTPException` do FastAPI em vez de um `DomainError` — token interno ausente, etc.
+HTTP_ERROR_TYPE = "http_error"
 
 
 def status_for(error: DomainError) -> int:
@@ -98,4 +105,17 @@ async def validation_error_handler(
         status=422,
         detail="; ".join(f"{e['loc'][-1]}: {e['msg']}" for e in exc.errors()),
         fields=fields or None,
+    )
+
+
+async def http_exception_handler(
+    request: Request, exc: StarletteHTTPException
+) -> JSONResponse:
+    """Mesmo envelope da seção 2.5 para as rotas administrativas, que levantam
+    `HTTPException` (ex: token interno inválido) em vez de um `DomainError`."""
+    return problem_response(
+        type_=HTTP_ERROR_TYPE,
+        title="Erro na requisição",
+        status=exc.status_code,
+        detail=str(exc.detail),
     )

@@ -1,0 +1,32 @@
+version: 1
+schema: eventos_navegacao
+
+dimensions:
+  pais:
+    type: string
+    filterable: true
+  dispositivo:
+    type: string
+    filterable: true
+
+measures:
+  duracao_media:
+    agg: avg
+  total_eventos:
+    agg: value_count
+
+datasets:
+  - name: eventos_navegacao_es
+    datasource:
+      type: elasticsearch
+      connection_ref: env:ES_EVENTOS_URL
+    provides:
+      dimensions: [pais, dispositivo]
+      measures: [duracao_media, total_eventos]
+    index:
+      name: eventos-navegacao
+      mapping:
+        pais: { field: pais, es_type: keyword }
+        dispositivo: { field: dispositivo, es_type: keyword }
+        duracao_media: { field: duracao_sessao, agg: avg }
+        total_eventos: { field: duracao_sessao, agg: value_count }

@@ -1,0 +1,32 @@
+version: 1
+schema: estoque
+
+dimensions:
+  filial:
+    type: string
+    filterable: true
+  produto:
+    type: string
+    filterable: true
+
+measures:
+  quantidade_disponivel:
+    agg: sum
+  valor_unitario:
+    agg: avg
+
+datasets:
+  - name: estoque_atual_pg
+    datasource:
+      type: postgres
+      connection_ref: env:APP_ESTOQUE_URL
+    provides:
+      dimensions: [filial, produto]
+      measures: [quantidade_disponivel, valor_unitario]
+    table:
+      source: app.vw_estoque_atual
+      mapping:
+        filial: { column: filial }
+        produto: { column: produto }
+        quantidade_disponivel: { column: qtd_disponivel, agg: sum }
+        valor_unitario: { column: vl_unitario, agg: avg }
