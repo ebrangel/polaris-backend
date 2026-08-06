@@ -12,7 +12,13 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from adapters.api.dependencies import CatalogDep, ExecuteQueryDep, JobQueueDep, RolesDep
+from adapters.api.dependencies import (
+    CatalogDep,
+    ClientIdDep,
+    ExecuteQueryDep,
+    JobQueueDep,
+    RolesDep,
+)
 from adapters.api.errors import (
     MALFORMED_REQUEST_TYPE,
     UNKNOWN_QUERY_TYPE,
@@ -67,17 +73,23 @@ def _response_for(result: QueryResult) -> JSONResponse:
 
 
 async def _run(
-    domain_request: QueryRequest, execute_query: ExecuteQueryDep, roles: RolesDep
+    domain_request: QueryRequest,
+    execute_query: ExecuteQueryDep,
+    roles: RolesDep,
+    client_id: ClientIdDep,
 ) -> JSONResponse:
-    result = await execute_query(domain_request, roles=roles)
+    result = await execute_query(domain_request, roles=roles, client_id=client_id)
     return _response_for(result)
 
 
 @router.post("")
 async def post_query(
-    body: QueryRequestModel, execute_query: ExecuteQueryDep, roles: RolesDep
+    body: QueryRequestModel,
+    execute_query: ExecuteQueryDep,
+    roles: RolesDep,
+    client_id: ClientIdDep,
 ) -> JSONResponse:
-    return await _run(body.to_domain(), execute_query, roles)
+    return await _run(body.to_domain(), execute_query, roles, client_id)
 
 
 @router.get("")
@@ -86,6 +98,7 @@ async def get_query(
     catalog: CatalogDep,
     execute_query: ExecuteQueryDep,
     roles: RolesDep,
+    client_id: ClientIdDep,
 ) -> JSONResponse:
     """Recebe o `Request` cru: `filter[campo][operador]` usa chaves dinâmicas, que o
     FastAPI não consegue declarar como parâmetros (limitação anotada na seção 2.2a)."""
@@ -101,7 +114,7 @@ async def get_query(
         schema = catalog.get_schema(schema_name_from_params(params))
         model = parse_flat_params(params, schema)
 
-    return await _run(model.to_domain(), execute_query, roles)
+    return await _run(model.to_domain(), execute_query, roles, client_id)
 
 
 @router.get("/{query_id}")

@@ -71,6 +71,13 @@ def test_load_settings_le_os_opcionais_quando_presentes(env_obrigatorio, monkeyp
     monkeypatch.setenv("CACHE_TTL_SECONDS", "60")
     monkeypatch.setenv("LIGHT_POOL_SIZE", "10")
     monkeypatch.setenv("HEAVY_POOL_SIZE", "2")
+    monkeypatch.setenv("SLOW_QUERY_THRESHOLD_MS", "500")
+    monkeypatch.setenv("REQUEST_RATE_LIMIT", "50")
+    monkeypatch.setenv("REQUEST_RATE_LIMIT_WINDOW_SECONDS", "30")
+    monkeypatch.setenv("HEAVY_QUERY_RATE_LIMIT", "3")
+    monkeypatch.setenv("HEAVY_QUERY_RATE_LIMIT_WINDOW_SECONDS", "120")
+    monkeypatch.setenv("MAX_HEAVY_QUEUE_DEPTH", "10")
+    monkeypatch.setenv("LOG_LEVEL", "DEBUG")
 
     settings = load_settings()
 
@@ -81,6 +88,13 @@ def test_load_settings_le_os_opcionais_quando_presentes(env_obrigatorio, monkeyp
     assert settings.cache_ttl_seconds == 60
     assert settings.light_pool_size == 10
     assert settings.heavy_pool_size == 2
+    assert settings.slow_query_threshold_ms == 500
+    assert settings.request_rate_limit == 50
+    assert settings.request_rate_limit_window_seconds == 30
+    assert settings.heavy_query_rate_limit == 3
+    assert settings.heavy_query_rate_limit_window_seconds == 120
+    assert settings.max_heavy_queue_depth == 10
+    assert settings.log_level == "DEBUG"
 
 
 def test_load_settings_usa_defaults_dos_opcionais_ausentes(env_obrigatorio):
@@ -92,3 +106,10 @@ def test_load_settings_usa_defaults_dos_opcionais_ausentes(env_obrigatorio):
     assert settings.cache_ttl_seconds == 3600
     assert settings.light_pool_size == 20
     assert settings.heavy_pool_size == 3
+    assert settings.slow_query_threshold_ms == 2000
+    assert settings.request_rate_limit == 100
+    assert settings.request_rate_limit_window_seconds == 60
+    assert settings.heavy_query_rate_limit == 5
+    assert settings.heavy_query_rate_limit_window_seconds == 60
+    assert settings.max_heavy_queue_depth == 100
+    assert settings.log_level == "INFO"

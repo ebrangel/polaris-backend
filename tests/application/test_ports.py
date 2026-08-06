@@ -18,6 +18,7 @@ from application.ports.catalog_repository import CatalogRepository
 from application.ports.datasource_inspector import DatasourceInspector
 from application.ports.job_queue import JobQueue
 from application.ports.query_executor import ExecutionProfile, QueryCost, QueryExecutor
+from application.ports.rate_limiter import RateLimiter
 from domain.errors import QueryTimeoutError
 from domain.models import QueryRequest, QueryResult
 from fakes import (
@@ -25,6 +26,7 @@ from fakes import (
     InMemoryCatalogInvalidator,
     InMemoryCatalogRepository,
     InMemoryJobQueue,
+    InMemoryRateLimiter,
     StubDatasourceInspector,
     StubQueryExecutor,
 )
@@ -38,10 +40,11 @@ PORT_METHODS = {
         ("get_active_version", "list_active_versions", "publish_new_version"),
     ),
     QueryExecutor: (StubQueryExecutor, ("execute", "estimate_cost")),
-    CacheGateway: (InMemoryCacheGateway, ("get", "set", "delete")),
+    CacheGateway: (InMemoryCacheGateway, ("get", "set", "delete", "stats")),
     JobQueue: (InMemoryJobQueue, ("enqueue", "get_status", "depth")),
     DatasourceInspector: (StubDatasourceInspector, ("missing_fields",)),
     CatalogInvalidator: (InMemoryCatalogInvalidator, ("publish",)),
+    RateLimiter: (InMemoryRateLimiter, ("allow",)),
 }
 
 
@@ -194,6 +197,19 @@ async def test_cache_gateway_delete_remove_a_entrada(sample_result):
     assert await cache.get(sample_result.query_id) is None
 
 
+async def test_cache_gateway_stats_acompanha_hits_e_misses(sample_result):
+    cache = InMemoryCacheGateway()
+    await cache.set(sample_result.query_id, sample_result)
+
+    await cache.get(sample_result.query_id)  # hit
+    await cache.get("q_inexistente")  # miss
+    await cache.get("q_inexistente")  # miss
+
+    stats = await cache.stats()
+    assert stats.hits == 1
+    assert stats.misses == 2
+
+
 # --- JobQueue ------------------------------------------------------------------------------
 
 
@@ -329,3 +345,22 @@ async def test_query_executor_recebe_o_profile_pesado_da_fila():
     await executor.execute(dataset, request, (), profile=ExecutionProfile.HEAVY)
 
     assert executor.calls[0][3] is ExecutionProfile.HEAVY
+
+
+# --- RateLimiter (Marco 9) -----------------------------------------------------------------
+
+
+async def test_rate_limiter_permite_ate_o_limite_e_recusa_depois():
+    limiter = InMemoryRateLimiter(limit=2)
+
+    assert await limiter.allow("cliente-1") is True
+    assert await limiter.allow("cliente-1") is True
+    assert await limiter.allow("cliente-1") is False
+
+
+async def test_rate_limiter_contadores_independentes_por_cliente():
+    limiter = InMemoryRateLimiter(limit=1)
+
+    assert await limiter.allow("cliente-a") is True
+    assert await limiter.allow("cliente-b") is True  # outro cliente, outro contador
+    assert await limiter.allow("cliente-a") is False

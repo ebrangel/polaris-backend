@@ -122,3 +122,20 @@ async def test_chave_usa_o_prefixo_configurado(redis_client):
     raw = await redis_client.get("test:q_1")
 
     assert raw is not None
+
+
+async def test_stats_acompanha_hits_e_misses_reais(redis_client):
+    """`cache:hits`/`cache:misses` são chaves fixas, compartilhadas por todo o
+    processo (Marco 9) — os demais testes deste módulo também as incrementam, então a
+    asserção é sobre a variação, não sobre um valor absoluto."""
+    cache = RedisCacheGateway(redis_client, key_prefix="test_stats:")
+    before = await cache.stats()
+
+    await cache.get("q_stats_ausente")  # miss
+    await cache.set("q_stats_presente", _resultado_da_secao_2_3("q_stats_presente"))
+    await cache.get("q_stats_presente")  # hit
+
+    after = await cache.stats()
+
+    assert after.misses == before.misses + 1
+    assert after.hits == before.hits + 1

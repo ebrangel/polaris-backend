@@ -45,6 +45,14 @@ class Settings:
     cache_ttl_seconds: int = 3600
     light_pool_size: int = 20
     heavy_pool_size: int = 3
+    # --- Observabilidade (Marco 9) ---------------------------------------------------
+    slow_query_threshold_ms: int = 2000
+    request_rate_limit: int = 100
+    request_rate_limit_window_seconds: int = 60
+    heavy_query_rate_limit: int = 5
+    heavy_query_rate_limit_window_seconds: int = 60
+    max_heavy_queue_depth: int = 100
+    log_level: str = "INFO"
 
 
 def load_settings() -> Settings:
@@ -59,4 +67,15 @@ def load_settings() -> Settings:
         cache_ttl_seconds=int(os.environ.get("CACHE_TTL_SECONDS", "3600")),
         light_pool_size=int(os.environ.get("LIGHT_POOL_SIZE", "20")),
         heavy_pool_size=int(os.environ.get("HEAVY_POOL_SIZE", "3")),
+        slow_query_threshold_ms=int(os.environ.get("SLOW_QUERY_THRESHOLD_MS", "2000")),
+        request_rate_limit=int(os.environ.get("REQUEST_RATE_LIMIT", "100")),
+        request_rate_limit_window_seconds=int(
+            os.environ.get("REQUEST_RATE_LIMIT_WINDOW_SECONDS", "60")
+        ),
+        heavy_query_rate_limit=int(os.environ.get("HEAVY_QUERY_RATE_LIMIT", "5")),
+        heavy_query_rate_limit_window_seconds=int(
+            os.environ.get("HEAVY_QUERY_RATE_LIMIT_WINDOW_SECONDS", "60")
+        ),
+        max_heavy_queue_depth=int(os.environ.get("MAX_HEAVY_QUEUE_DEPTH", "100")),
+        log_level=os.environ.get("LOG_LEVEL", "INFO"),
     )

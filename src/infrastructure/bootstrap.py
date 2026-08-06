@@ -10,6 +10,7 @@ sem pagar esse custo. `scripts/publish_catalog.py` importa só deste módulo —
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 
@@ -22,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from adapters.api import create_app
 from adapters.cache.redis_cache import RedisCacheGateway
 from adapters.cache.redis_pubsub import RedisCatalogInvalidator, listen_for_invalidation
+from adapters.cache.redis_rate_limiter import RedisRateLimiter
 from adapters.catalog.postgres_inspector import PostgresInspector
 from adapters.executors import ElasticsearchQueryExecutor, SQLAlchemyQueryExecutor
 from adapters.queue.arq_queue import ArqJobQueue
@@ -32,6 +34,7 @@ from application.ports.datasource_inspector import DatasourceInspector
 from application.ports.query_executor import QueryExecutor
 from application.use_cases import (
     ExecuteQuery,
+    GetObservabilitySnapshot,
     LoadCatalog,
     PublishCatalog,
     ResolveDataset,
@@ -40,6 +43,12 @@ from application.use_cases import (
 from domain.models import Catalog, DatasourceType
 from infrastructure import db
 from infrastructure.config import Settings, load_settings
+
+
+def _configure_logging(settings: Settings) -> None:
+    """Chamado uma vez por processo (API ou worker) — sem isso, o log de consultas
+    lentas (Marco 9) roda para um logger sem handler nenhum, e nada aparece."""
+    logging.basicConfig(level=settings.log_level)
 
 
 @dataclass
@@ -148,6 +157,7 @@ def _build_lifespan(
 
 async def create_application() -> FastAPI:
     settings = load_settings()
+    _configure_logging(settings)
     context = await build_context(settings)
 
     cache_client = Redis.from_url(settings.redis_url, decode_responses=True)
@@ -156,6 +166,21 @@ async def create_application() -> FastAPI:
     job_queue_pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
     job_queue = ArqJobQueue(job_queue_pool)
 
+    # Duas instâncias do mesmo adapter, config diferente — mesmo padrão de
+    # `executors`, um port com várias instâncias por chave (Marco 9).
+    request_rate_limiter = RedisRateLimiter(
+        cache_client,
+        limit=settings.request_rate_limit,
+        window_seconds=settings.request_rate_limit_window_seconds,
+        key_prefix="ratelimit:request:",
+    )
+    heavy_query_rate_limiter = RedisRateLimiter(
+        cache_client,
+        limit=settings.heavy_query_rate_limit,
+        window_seconds=settings.heavy_query_rate_limit_window_seconds,
+        key_prefix="ratelimit:heavy:",
+    )
+
     execute_query = ExecuteQuery(
         catalog=context.catalog,
         resolve_dataset=ResolveDataset(),
@@ -163,6 +188,10 @@ async def create_application() -> FastAPI:
         cache=cache,
         job_queue=job_queue,
         cache_ttl_seconds=settings.cache_ttl_seconds,
+        request_rate_limiter=request_rate_limiter,
+        heavy_query_rate_limiter=heavy_query_rate_limiter,
+        max_heavy_queue_depth=settings.max_heavy_queue_depth,
+        slow_query_threshold_ms=settings.slow_query_threshold_ms,
     )
 
     invalidator = RedisCatalogInvalidator(
@@ -174,12 +203,15 @@ async def create_application() -> FastAPI:
         invalidator=invalidator,
     )
 
+    get_observability_snapshot = GetObservabilitySnapshot(cache=cache, job_queue=job_queue)
+
     return create_app(
         catalog=context.catalog,
         execute_query=execute_query,
         job_queue=job_queue,
         publish_catalog=publish_catalog,
         catalog_repository=context.catalog_repository,
+        get_observability_snapshot=get_observability_snapshot,
         internal_token=settings.internal_token,
         lifespan=_build_lifespan(context),
     )
@@ -187,7 +219,12 @@ async def create_application() -> FastAPI:
 
 async def create_worker_settings() -> type:
     settings = load_settings()
+    _configure_logging(settings)
     context = await build_context(settings)
-    run_queued_query = RunQueuedQuery(catalog=context.catalog, executors=context.executors)
+    run_queued_query = RunQueuedQuery(
+        catalog=context.catalog,
+        executors=context.executors,
+        slow_query_threshold_ms=settings.slow_query_threshold_ms,
+    )
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
     return build_worker_settings(run_queued_query, redis_settings)

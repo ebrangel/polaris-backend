@@ -2,12 +2,14 @@
 nome (não chama `ResolveDataset` de novo) e executa no perfil `HEAVY`.
 """
 
+import logging
+
 import pytest
 from fixtures import catalog, vendas_schema
 
 from application.ports.query_executor import ExecutionProfile
 from application.use_cases.run_queued_query import RunQueuedQuery
-from domain.models import Catalog, QueryRequest, QueryStatus
+from domain.models import Catalog, QueryRequest, QueryResult, QueryStatus
 from fakes import StubQueryExecutor
 
 
@@ -68,3 +70,47 @@ async def test_erro_do_executor_propaga():
 
     with pytest.raises(QueryTimeoutError):
         await run(request, dataset_name="vendas_agregado_uf")
+
+
+# --- Log de consultas lentas (Marco 9) ------------------------------------------------------
+
+
+async def test_consulta_pesada_lenta_gera_log_de_warning(caplog):
+    slow_result = QueryResult.completed(
+        query_id="q_pesado1",
+        columns=(),
+        rows=(),
+        dataset_used="vendas_agregado_uf",
+        execution_ms=9000,
+    )
+    stub = StubQueryExecutor(result=slow_result)
+    run = RunQueuedQuery(
+        catalog=catalog(),
+        executors={"env:DW_VENDAS_PG_URL": stub},
+        slow_query_threshold_ms=5000,
+    )
+    request = QueryRequest(schema="vendas", dimensions=("sigla_uf",))
+
+    with caplog.at_level(logging.WARNING):
+        await run(request, dataset_name="vendas_agregado_uf")
+
+    assert any("consulta lenta" in record.message for record in caplog.records)
+    assert any("q_pesado1" in record.message for record in caplog.records)
+
+
+async def test_sem_threshold_configurado_nunca_loga(caplog):
+    slow_result = QueryResult.completed(
+        query_id="q_pesado2",
+        columns=(),
+        rows=(),
+        dataset_used="vendas_agregado_uf",
+        execution_ms=999_999,
+    )
+    stub = StubQueryExecutor(result=slow_result)
+    run = RunQueuedQuery(catalog=catalog(), executors={"env:DW_VENDAS_PG_URL": stub})
+    request = QueryRequest(schema="vendas", dimensions=("sigla_uf",))
+
+    with caplog.at_level(logging.WARNING):
+        await run(request, dataset_name="vendas_agregado_uf")
+
+    assert caplog.records == []

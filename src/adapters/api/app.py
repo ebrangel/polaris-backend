@@ -19,10 +19,12 @@ from adapters.api.errors import (
 )
 from adapters.api.routers import admin as admin_router
 from adapters.api.routers import catalog as catalog_router
+from adapters.api.routers import observability as observability_router
 from adapters.api.routers import query as query_router
 from application.ports.catalog_repository import CatalogRepository
 from application.ports.job_queue import JobQueue
 from application.use_cases.execute_query import ExecuteQuery
+from application.use_cases.get_observability_snapshot import GetObservabilitySnapshot
 from application.use_cases.publish_catalog import PublishCatalog
 from domain.errors import DomainError
 from domain.models import Catalog
@@ -35,13 +37,14 @@ def create_app(
     job_queue: JobQueue,
     publish_catalog: PublishCatalog | None = None,
     catalog_repository: CatalogRepository | None = None,
+    get_observability_snapshot: GetObservabilitySnapshot | None = None,
     internal_token: str | None = None,
     lifespan: Callable[[FastAPI], AbstractAsyncContextManager[None]] | None = None,
 ) -> FastAPI:
-    """`publish_catalog`/`catalog_repository`/`internal_token` são opcionais e
-    aditivos (Marco 8): sem eles, `/internal/catalog/*` simplesmente não é montado —
-    os testes do contrato de `/v1/*` (Marco 6) continuam chamando `create_app` sem
-    conhecer o pipeline de publicação.
+    """`publish_catalog`/`catalog_repository`/`get_observability_snapshot`/
+    `internal_token` são opcionais e aditivos (Marcos 8/9): sem eles, `/internal/*`
+    simplesmente não é montado — os testes do contrato de `/v1/*` (Marco 6) continuam
+    chamando `create_app` sem conhecer publicação nem observabilidade.
 
     `lifespan` é onde `main.py` pluga o assinante do pub/sub (`listen_for_invalidation`,
     Marco 8) como uma task de fundo — este adapter não sabe nada sobre Redis, só
@@ -62,6 +65,7 @@ def create_app(
     app.state.job_queue = job_queue
     app.state.publish_catalog = publish_catalog
     app.state.catalog_repository = catalog_repository
+    app.state.get_observability_snapshot = get_observability_snapshot
     app.state.internal_token = internal_token
 
     # Todo erro de domínio vira o envelope único da seção 2.5; `DomainError` é a base
@@ -74,4 +78,6 @@ def create_app(
     app.include_router(query_router.router)
     if publish_catalog is not None and catalog_repository is not None:
         app.include_router(admin_router.router)
+    if get_observability_snapshot is not None:
+        app.include_router(observability_router.router)
     return app

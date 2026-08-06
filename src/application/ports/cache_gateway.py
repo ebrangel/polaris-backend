@@ -4,9 +4,19 @@ A chave é sempre `QueryRequest.query_id`, já implementado no domínio (Marco 1
 port não conhece nada sobre como a chave é formada, só recebe `str`.
 """
 
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from domain.models import QueryResult
+
+
+@dataclass(frozen=True, slots=True)
+class CacheStats:
+    """Contadores acumulados desde o boot do processo — a taxa de acerto (Marco 9) é
+    derivada disso por quem consome (`GetObservabilitySnapshot`), não guardada aqui."""
+
+    hits: int
+    misses: int
 
 
 @runtime_checkable
@@ -28,4 +38,8 @@ class CacheGateway(Protocol):
 
     async def delete(self, key: str) -> None:
         """Remove uma entrada do cache (ex: invalidação após publicação de catálogo)."""
+        ...
+
+    async def stats(self) -> CacheStats:
+        """Contadores de acerto/erro acumulados (Marco 9, observabilidade)."""
         ...

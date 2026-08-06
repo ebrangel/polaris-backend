@@ -9,7 +9,13 @@ import json
 from redis.asyncio import Redis
 
 from adapters.serialization import dict_to_result, result_to_dict
+from application.ports.cache_gateway import CacheStats
 from domain.models import QueryResult, QueryStatus
+
+#: Chaves fixas, sem TTL — contadores acumulados desde o boot do processo (Marco 9),
+#: não por janela de tempo (isso é o rate limiter, não a taxa de acerto de cache).
+_HITS_KEY = "cache:hits"
+_MISSES_KEY = "cache:misses"
 
 
 class RedisCacheGateway:
@@ -28,7 +34,9 @@ class RedisCacheGateway:
     async def get(self, key: str) -> QueryResult | None:
         raw = await self._client.get(self._redis_key(key))
         if raw is None:
+            await self._client.incr(_MISSES_KEY)
             return None
+        await self._client.incr(_HITS_KEY)
         return dict_to_result(json.loads(raw))
 
     async def set(self, key: str, result: QueryResult, ttl_seconds: int | None = None) -> None:
@@ -41,3 +49,7 @@ class RedisCacheGateway:
 
     async def delete(self, key: str) -> None:
         await self._client.delete(self._redis_key(key))
+
+    async def stats(self) -> CacheStats:
+        hits, misses = await self._client.mget(_HITS_KEY, _MISSES_KEY)
+        return CacheStats(hits=int(hits or 0), misses=int(misses or 0))

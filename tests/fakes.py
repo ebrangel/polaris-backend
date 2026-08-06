@@ -8,6 +8,7 @@ para testar a orquestração do use case `ExecuteQuery` sem nenhum banco real.
 from datetime import UTC, datetime
 
 from application.catalog_codec import decompile_schema
+from application.ports.cache_gateway import CacheStats
 from application.ports.query_executor import ExecutionProfile, QueryCost
 from domain.models import CatalogVersion, Dataset, QueryRequest, QueryResult, QueryStatus
 
@@ -113,6 +114,24 @@ class InMemoryCacheGateway:
 
     async def delete(self, key: str) -> None:
         self._store.pop(key, None)
+
+    async def stats(self) -> CacheStats:
+        return CacheStats(hits=self.hits, misses=self.misses)
+
+
+class InMemoryRateLimiter:
+    """Fake do `RateLimiter`: teto fixo por `client_id`, contadores independentes."""
+
+    def __init__(self, limit: int = 1_000_000) -> None:
+        self._limit = limit
+        self._counts: dict[str, int] = {}
+        self.calls: list[str] = []
+
+    async def allow(self, client_id: str) -> bool:
+        self.calls.append(client_id)
+        count = self._counts.get(client_id, 0) + 1
+        self._counts[client_id] = count
+        return count <= self._limit
 
 
 class StubDatasourceInspector:
