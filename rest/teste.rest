@@ -17,6 +17,13 @@ GET http://localhost:8000/v1/query
 ?query=%7B%22schema%22%3A%22vendas%22%2C%22dimensions%22%3A%5B%22sigla_uf%22%5D%7D
 
 ###
+GET http://localhost:8000/v1/query
+?schema=vendas
+&dimensions=sigla_uf
+&measures=valor_total
+
+
+###
 # Opção B — parâmetros planos, para curl e links de dashboard
 GET http://localhost:8000/v1/query
 ?schema=vendas
@@ -25,3 +32,36 @@ GET http://localhost:8000/v1/query
 &filter[sigla_uf][in]=SP,RJ
 &order_by=valor_total.desc
 &limit=100
+
+###
+# Saída em CSV (seção 2.3a) — parâmetro explícito, para link de download
+GET http://localhost:8000/v1/query
+?schema=vendas
+&dimensions=sigla_uf
+#&measures=valor_total
+&format=csv
+
+###
+# Saída em CSV via negociação de conteúdo, para cliente programático
+POST http://localhost:8000/v1/query HTTP/1.1
+content-type: application/json
+accept: text/csv
+X-Roles: admin,financeiro
+
+{
+    "schema": "vendas",
+    "dimensions": ["sigla_uf"],
+    "measures": ["valor_total"]
+}
+
+###
+# Saída em CSV via negociação de conteúdo, para cliente programático
+POST http://localhost:8000/v1/query HTTP/1.1
+content-type: application/json
+accept: text/csv
+
+{
+    "schema": "estoque",
+    "dimensions": ["filial"],
+    "measures": ["quantidade_disponivel"]
+}

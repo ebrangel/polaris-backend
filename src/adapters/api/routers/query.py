@@ -8,15 +8,18 @@ negócio vive aqui: o router traduz HTTP, o `ExecuteQuery` decide.
 
 import json
 
-from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
+from adapters.api.content_negotiation import CSV_MEDIA_TYPE, OutputFormat
+from adapters.api.csv_presenter import csv_headers, csv_lines
 from adapters.api.dependencies import (
     CatalogDep,
     ClientIdDep,
     ExecuteQueryDep,
     JobQueueDep,
+    OutputFormatDep,
     RolesDep,
 )
 from adapters.api.errors import (
@@ -66,10 +69,33 @@ def _model_from_json(raw: str) -> QueryRequestModel | JSONResponse:
         )
 
 
-def _response_for(result: QueryResult) -> JSONResponse:
-    """202 para consulta enfileirada (seção 2.4); 200 para resultado pronto (2.3)."""
-    status_code = 202 if result.status is QueryStatus.PROCESSING else 200
-    return JSONResponse(status_code=status_code, content=present_result(result))
+def _completed_response(result: QueryResult, output_format: OutputFormat) -> Response:
+    """Corpo da seção 2.3 no formato negociado (seção 2.3a) — o **único** ponto do
+    caminho da consulta em que o formato de saída importa."""
+    if output_format is OutputFormat.CSV:
+        return StreamingResponse(
+            csv_lines(result),
+            status_code=200,
+            media_type=CSV_MEDIA_TYPE,
+            headers=csv_headers(result),
+        )
+    return JSONResponse(status_code=200, content=present_result(result))
+
+
+def _response_for(result: QueryResult, output_format: OutputFormat) -> Response:
+    """202 para consulta enfileirada (seção 2.4); 200 para resultado pronto (2.3).
+
+    A resposta de enfileiramento (e a de falha) sai **sempre em JSON**, qualquer que
+    seja o formato pedido: `{query_id, status, poll_url}` não é uma tabela e não tem
+    representação em CSV. Recusar CSV para consulta pesada seria pior — export grande é
+    justamente o caso de uso do formato; o cliente enfileira, acompanha o status em
+    JSON e baixa o CSV em `GET /v1/query/{query_id}?format=csv`.
+    """
+    if result.status is QueryStatus.PROCESSING:
+        return JSONResponse(status_code=202, content=present_result(result))
+    if result.status is QueryStatus.FAILED:
+        return JSONResponse(status_code=200, content=present_result(result))
+    return _completed_response(result, output_format)
 
 
 async def _run(
@@ -77,9 +103,10 @@ async def _run(
     execute_query: ExecuteQueryDep,
     roles: RolesDep,
     client_id: ClientIdDep,
-) -> JSONResponse:
+    output_format: OutputFormat,
+) -> Response:
     result = await execute_query(domain_request, roles=roles, client_id=client_id)
-    return _response_for(result)
+    return _response_for(result, output_format)
 
 
 @router.post("")
@@ -88,8 +115,12 @@ async def post_query(
     execute_query: ExecuteQueryDep,
     roles: RolesDep,
     client_id: ClientIdDep,
-) -> JSONResponse:
-    return await _run(body.to_domain(), execute_query, roles, client_id)
+    output_format: OutputFormatDep,
+) -> Response:
+    """O formato de saída vem de `?format=`/`Accept`, e não do corpo: o corpo continua
+    sendo exatamente `QueryRequestModel` (com `extra="forbid"`), o que garante que
+    formato nenhum vaze para dentro do `QueryRequest` e do `query_id`."""
+    return await _run(body.to_domain(), execute_query, roles, client_id, output_format)
 
 
 @router.get("")
@@ -99,9 +130,16 @@ async def get_query(
     execute_query: ExecuteQueryDep,
     roles: RolesDep,
     client_id: ClientIdDep,
-) -> JSONResponse:
+    output_format: OutputFormatDep,
+) -> Response:
     """Recebe o `Request` cru: `filter[campo][operador]` usa chaves dinâmicas, que o
-    FastAPI não consegue declarar como parâmetros (limitação anotada na seção 2.2a)."""
+    FastAPI não consegue declarar como parâmetros (limitação anotada na seção 2.2a).
+
+    `format` escapa da regra "se `query` estiver presente, os demais parâmetros são
+    ignorados": aquela regra existe para não haver duas fontes de verdade da *consulta*,
+    e o formato de saída não é parte da consulta — é transporte, lido pela dependência
+    antes desta função, nas duas opções.
+    """
     params = request.query_params
 
     raw_query = params.get("query")
@@ -114,16 +152,21 @@ async def get_query(
         schema = catalog.get_schema(schema_name_from_params(params))
         model = parse_flat_params(params, schema)
 
-    return await _run(model.to_domain(), execute_query, roles, client_id)
+    return await _run(model.to_domain(), execute_query, roles, client_id, output_format)
 
 
 @router.get("/{query_id}")
-async def get_query_status(query_id: str, job_queue: JobQueueDep) -> JSONResponse:
+async def get_query_status(
+    query_id: str, job_queue: JobQueueDep, output_format: OutputFormatDep
+) -> Response:
     """Status/resultado de uma consulta assíncrona (seção 2.4).
 
     Sempre 200 quando o `query_id` existe — inclusive com `status: processing`: aqui a
     leitura de status é que teve sucesso. O 202 é da submissão, não da consulta de
     status.
+
+    Com `?format=csv` este é o passo de download do fluxo assíncrono: o cliente
+    acompanha o status em JSON e, quando `completed`, baixa o resultado como arquivo.
     """
     result = await job_queue.get_status(query_id)
     if result is None:
@@ -134,4 +177,6 @@ async def get_query_status(query_id: str, job_queue: JobQueueDep) -> JSONRespons
             detail=f"Nenhuma consulta com o identificador '{query_id}'.",
             fields=[query_id],
         )
+    if result.status is QueryStatus.COMPLETED:
+        return _completed_response(result, output_format)
     return JSONResponse(status_code=200, content=present_result(result))

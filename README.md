@@ -247,6 +247,18 @@ curl -s -X POST localhost:8000/v1/query \
   -d '{"schema":"estoque","dimensions":["filial"],"measures":["quantidade_disponivel"]}' | jq
 ```
 
+A mesma consulta, baixada como CSV:
+
+```bash
+curl -s 'localhost:8000/v1/query?schema=estoque&dimensions=filial&measures=quantidade_disponivel&format=csv'
+```
+
+```
+filial,quantidade_disponivel
+Matriz,420
+Filial SP,45
+```
+
 ---
 
 ## Endpoints
@@ -262,7 +274,8 @@ curl -s -X POST localhost:8000/v1/query \
 | `GET` | `/v1/query/{query_id}` | Status/resultado de uma consulta assíncrona |
 
 `GET /v1/catalog/{schema}` devolve **apenas o modelo lógico** — datasets e roteamento são detalhe
-interno e não são expostos.
+interno e não são expostos. As três rotas de consulta aceitam `?format=` e o header `Accept` para
+escolher entre JSON e CSV — veja [Formatos de saída](#formatos-de-saída).
 
 ### Internos (exigem `X-Internal-Token`)
 
@@ -297,6 +310,101 @@ GET /v1/query?schema=vendas&dimensions=sigla_uf,cargo&measures=valor_total\
 Se `query` estiver presente, os demais parâmetros são ignorados. As duas formas convergem para o
 mesmo objeto de domínio antes de chegar ao use case — nenhuma regra de negócio é duplicada.
 
+### Formatos de saída
+
+A resposta pode sair em **JSON** (padrão) ou **CSV**. A escolha é feita, nesta ordem de
+precedência:
+
+1. `?format=csv` (ou `?format=json`) na querystring — vale também no `POST`;
+2. o header `Accept: text/csv`;
+3. JSON, por omissão.
+
+```bash
+# Link de dashboard / download pelo navegador — o parâmetro explícito
+curl -s 'localhost:8000/v1/query?schema=vendas&dimensions=sigla_uf&measures=valor_total&format=csv'
+
+# Cliente programático — negociação de conteúdo
+curl -s localhost:8000/v1/query \
+  -H 'Content-Type: application/json' -H 'Accept: text/csv' \
+  -d '{"schema":"vendas","dimensions":["sigla_uf"],"measures":["valor_total"]}'
+
+# O parâmetro vence o header
+curl -s 'localhost:8000/v1/query?schema=vendas&dimensions=sigla_uf&format=json' \
+  -H 'Accept: text/csv' | jq
+```
+
+O `?format=` existe **além** do `Accept` porque o caso de uso real do CSV é um link que o usuário
+clica para baixar — e navegador manda `Accept: text/html,…`, de modo que negociação por header
+sozinha nunca entregaria CSV nesse fluxo.
+
+**O formato não faz parte da consulta.** Ele não entra no `query_id` nem na chave de cache: a mesma
+consulta pedida em JSON e em CSV é executada **uma vez só** e compartilha a mesma entrada de cache.
+Por isso `format` é sempre querystring ou header, nunca campo do corpo — um `format` dentro do JSON
+é recusado como `malformed_request`.
+
+#### O CSV
+
+Segue a RFC 4180: vírgula como delimitador, registros terminados por CRLF, aspas duplicadas quando o
+valor contém delimitador, aspas ou quebra de linha. A primeira linha traz os **nomes lógicos** dos
+campos — nunca a coluna física do dataset.
+
+```http
+GET /v1/query?schema=vendas&dimensions=sigla_uf&measures=valor_total&format=csv
+
+200 OK
+Content-Type: text/csv; charset=utf-8; header=present
+Content-Disposition: attachment; filename="q_8f2a1c.csv"
+X-Query-Id: q_8f2a1c
+X-Row-Count: 2
+X-Cached: true
+X-Execution-Ms: 12
+X-Dataset-Used: vendas_agregado_uf
+
+sigla_uf,valor_total
+SP,458320.50
+RJ,212904.10
+```
+
+Como o CSV é uma grade de dados e não tem onde carregar o `meta` da resposta JSON, esses metadados
+saem em headers `X-*` — a observabilidade continua disponível para quem consome por código.
+
+| Valor | Vira | Por quê |
+|---|---|---|
+| `null` | campo vazio | Nunca `None` nem `null` — é o que uma planilha espera |
+| booleano | `true` / `false` | Mesmo texto do JSON |
+| data | ISO 8601 | `2024-03-15` |
+| decimal | texto exato do banco | Sem virar `float`, sem perder precisão |
+| lista (Elasticsearch) | JSON na célula | Não há como virar duas colunas numa grade |
+
+O `format` declarado na coluna (`"currency"`) é **dica de apresentação para o cliente e não é
+aplicado**: escrever `R$ 458.320,50` inutilizaria o arquivo para consumo programático.
+
+#### Consulta pesada em CSV
+
+Três respostas nunca saem em CSV, qualquer que seja o formato pedido: o `202` de enfileiramento e o
+`status: processing` (`{query_id, status, poll_url}` não é uma tabela), o `status: failed`, e
+qualquer erro — que continua em `application/problem+json`.
+
+O download de um export grande é, então:
+
+```bash
+# 1. submete — se for pesada, volta 202 em JSON
+curl -s -X POST 'localhost:8000/v1/query?format=csv' \
+  -H 'Content-Type: application/json' \
+  -d '{"schema":"vendas","dimensions":["sigla_uf","cargo"],"measures":["valor_total"]}' | jq
+# → { "query_id": "q_9d31be", "status": "processing", "poll_url": "/v1/query/q_9d31be" }
+
+# 2. acompanha em JSON
+curl -s localhost:8000/v1/query/q_9d31be | jq '.status'
+
+# 3. baixa em CSV quando concluir
+curl -s 'localhost:8000/v1/query/q_9d31be?format=csv' -o vendas.csv
+```
+
+> **Ainda não é streaming.** As linhas são geradas sob demanda, mas o executor materializa o
+> resultado inteiro antes de responder. Um `csv_stream` de verdade exige um port de execução por
+> streaming, com desvio de cache e de fila — está fora do escopo atual.
+
 ### Erros
 
 Formato único, estilo `application/problem+json`:
@@ -323,6 +431,7 @@ Formato único, estilo `application/problem+json`:
 | `invalid_catalog` | 422 | Catálogo malformado (publicação) |
 | `malformed_request` | 422 | Erro de forma (JSON/enum/tipo) |
 | `unknown_query` | 404 | `query_id` inexistente |
+| `invalid_format` | 422 | `?format=` com valor que a API não produz |
 
 ---
 
@@ -435,11 +544,11 @@ Detalhamento — mapa de arquivos, decisões de projeto e como estender — em
 
 ## Testes
 
-**380 testes**, divididos entre rápidos e de integração:
+**422 testes**, divididos entre rápidos e de integração:
 
 ```bash
-uv run pytest -q -m "not integration"   # 333 testes, ~1,5 s, sem Docker
-uv run pytest -q                        # 380 testes, ~40 s, com containers reais
+uv run pytest -q -m "not integration"   # 375 testes, ~1,5 s, sem Docker
+uv run pytest -q                        # 422 testes, ~40 s, com containers reais
 ```
 
 Os testes de integração sobem **Postgres, Elasticsearch e Redis de verdade** via
@@ -451,7 +560,7 @@ está disponível e se autopula quando não está, então a suíte rápida roda 
 | Invariantes do domínio | `tests/domain/` |
 | Orquestração dos use cases (com fakes) | `tests/application/` |
 | SQL gerado, Query DSL, execução real | `tests/adapters/executors/` |
-| Contrato HTTP, envelope de erro, rate limiting | `tests/adapters/api/` |
+| Contrato HTTP, envelope de erro, negociação de formato, rate limiting | `tests/adapters/api/` |
 | Cache, fila, pub/sub, rate limiter | `tests/adapters/cache/`, `tests/adapters/queue/` |
 | Repositório do catálogo e inspetores | `tests/adapters/repositories/`, `tests/adapters/catalog/` |
 | Regra de dependência entre camadas | `tests/test_layer_purity.py` |
@@ -476,14 +585,15 @@ documentação como objetos de domínio, e `tests/application/test_catalog_codec
 │   │   ├── use_cases/          # ExecuteQuery, ResolveDataset, PublishCatalog, ...
 │   │   └── catalog_codec.py    # dict ↔ Schema, JSON canônico, hash
 │   ├── adapters/
-│   │   ├── api/                # Routers FastAPI, envelope de erro, parsing de querystring
+│   │   ├── api/                # Routers FastAPI, envelope de erro, parsing de querystring,
+│   │   │                       #   negociação de formato e presenters (JSON/CSV)
 │   │   ├── executors/          # SQLAlchemy (Postgres/Oracle) e Elasticsearch
 │   │   ├── repositories/       # PostgresCatalogRepository
 │   │   ├── cache/              # Cache, pub/sub e rate limiter em Redis
 │   │   ├── queue/              # ArqJobQueue + task do worker
 │   │   └── catalog/            # Leitor de YAML e inspetores de datasource
 │   └── infrastructure/         # config.py, db.py, bootstrap.py
-└── tests/                      # 380 testes (fakes + testcontainers)
+└── tests/                      # 422 testes (fakes + testcontainers)
 ```
 
 ---
@@ -516,5 +626,8 @@ observabilidade.
 - **Manifesto `dependencies.yaml`** para dimensões compartilhadas entre schemas — enquanto o
   catálogo for pequeno, schemas autocontidos são mais simples (recomendação do próprio doc de
   pipeline).
-- **`format: "csv_stream"`** para exports grandes — previsto na seção 2.6 do contrato, não
-  implementado.
+- **Streaming de verdade no CSV** — `?format=csv` já existe e gera as linhas sob demanda, mas o
+  executor materializa o resultado inteiro antes de responder. O `csv_stream` da seção 2.6 exige um
+  port de execução por streaming, com desvio de cache e de fila.
+- **Delimitador configurável por requisição** — o presenter aceita `;` (o que o Excel em pt-BR
+  espera), mas não há parâmetro HTTP para escolhê-lo; o padrão é a vírgula da RFC 4180.

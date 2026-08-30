@@ -14,6 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from adapters.api.content_negotiation import UnsupportedFormatError
 from domain.errors import (
     DomainError,
     ForbiddenMeasureError,
@@ -52,6 +53,10 @@ UNKNOWN_QUERY_TYPE = "unknown_query"
 #: `type` genérico para as poucas rotas (administrativas, Marco 8) que ainda levantam
 #: `HTTPException` do FastAPI em vez de um `DomainError` — token interno ausente, etc.
 HTTP_ERROR_TYPE = "http_error"
+
+#: `?format=` com valor que a API não produz (seção 2.3a). Como `unknown_query`, é um
+#: `type` que a lista da seção 2.5 não previa.
+INVALID_FORMAT_TYPE = "invalid_format"
 
 
 def status_for(error: DomainError) -> int:
@@ -118,4 +123,25 @@ async def http_exception_handler(
         title="Erro na requisição",
         status=exc.status_code,
         detail=str(exc.detail),
+    )
+
+
+async def unsupported_format_handler(
+    request: Request, exc: UnsupportedFormatError
+) -> JSONResponse:
+    """`?format=` desconhecido (seção 2.3a).
+
+    Erro de formato de saída é respondido **em JSON**, como todos os outros: um corpo
+    de erro em CSV não teria onde carregar `type`/`title`/`detail`, e o cliente que
+    pediu CSV precisa justamente da explicação do que deu errado.
+    """
+    return problem_response(
+        type_=INVALID_FORMAT_TYPE,
+        title="Formato de saída não suportado",
+        status=422,
+        detail=(
+            f"Formato de saída '{exc.requested}' não existe — "
+            f"use um de: {', '.join(exc.supported)}."
+        ),
+        fields=["format"],
     )

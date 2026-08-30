@@ -248,6 +248,69 @@ Se `query` estiver presente, os demais parâmetros são ignorados (evita ambigui
 
 `meta.dataset_used` existe para depuração e observabilidade — permite ver qual fonte física atendeu cada requisição sem expor isso como algo que o cliente precisa declarar.
 
+### 2.3a Formato de saída — JSON (padrão) ou CSV
+
+A resposta da seção 2.3 pode ser pedida em CSV. O formato é escolhido por, nesta ordem
+de precedência:
+
+1. `?format=csv` (ou `?format=json`) na querystring — vale também no `POST`, onde o
+   corpo continua sendo exatamente o objeto da seção 2.2;
+2. o header `Accept: text/csv`;
+3. JSON, por omissão.
+
+O parâmetro existe além do `Accept` porque o caso de uso real do CSV é um link de
+dashboard que o usuário clica para baixar, e navegador manda `Accept: text/html,…` —
+negociação por header sozinha nunca entregaria CSV nesse fluxo.
+
+**O formato não faz parte da consulta.** Ele não entra no `query_id` (seção 3) nem na
+chave de cache: a mesma consulta pedida em JSON e em CSV é executada uma vez só e
+compartilha a mesma entrada de cache. Por isso `format` é sempre querystring/header, e
+nunca campo do corpo — um `format` dentro do corpo é rejeitado como `malformed_request`.
+Pela mesma razão, `format` é a única exceção à regra "se `query` estiver presente, os
+demais parâmetros são ignorados" (seção 2.2a): aquela regra é sobre a consulta, e o
+formato é transporte.
+
+O CSV segue a RFC 4180: vírgula como delimitador, registros terminados por CRLF, aspas
+duplicadas quando o valor contém delimitador, aspas ou quebra de linha. A primeira
+linha traz os **nomes lógicos** dos campos, os mesmos da seção 2.3 — nunca a coluna
+física do dataset.
+
+```
+GET /v1/query?schema=vendas&dimensions=sigla_uf&measures=valor_total&format=csv
+```
+
+```
+Content-Type: text/csv; charset=utf-8; header=present
+Content-Disposition: attachment; filename="q_8f2a1c.csv"
+X-Query-Id: q_8f2a1c
+X-Row-Count: 2
+X-Cached: true
+X-Execution-Ms: 12
+X-Dataset-Used: vendas_agregado_uf
+
+sigla_uf,valor_total
+SP,458320.50
+RJ,212904.10
+```
+
+Como o CSV é uma grade de dados e não tem onde carregar o `meta` da seção 2.3, esses
+metadados saem em headers `X-*`.
+
+Regras de valor: `null` vira campo vazio; booleano vira `true`/`false`; data sai em ISO
+8601; número decimal sai com a precisão exata do banco. O `format` declarado na coluna
+(`"currency"`) é dica de apresentação para o cliente e **não** é aplicado — o CSV leva
+o valor cru.
+
+Três respostas nunca saem em CSV, qualquer que seja o formato pedido:
+
+- o `202` de enfileiramento e o `status: processing` da seção 2.4 — `{query_id, status,
+  poll_url}` não é uma tabela;
+- o `status: failed`;
+- qualquer erro da seção 2.5, que continua em `application/problem+json`.
+
+O download de uma consulta pesada é, então: submeter, acompanhar `GET /v1/query/{query_id}`
+em JSON e, quando `completed`, baixar com `GET /v1/query/{query_id}?format=csv`.
+
 ### 2.4 Resposta — caso assíncrono (consulta pesada)
 
 ```json
@@ -276,11 +339,11 @@ Formato único de erro (estilo `application/problem+json`):
 }
 ```
 
-Tipos de erro previstos: `unknown_schema`, `unknown_field`, `invalid_filter`, `forbidden_measure` (quando o role do usuário não tem acesso à medida), `no_dataset_available` (nenhum dataset cobre a combinação pedida), `query_timeout`, `rate_limited`.
+Tipos de erro previstos: `unknown_schema`, `unknown_field`, `invalid_filter`, `forbidden_measure` (quando o role do usuário não tem acesso à medida), `no_dataset_available` (nenhum dataset cobre a combinação pedida), `query_timeout`, `rate_limited`, `invalid_format` (valor de `format` que a API não produz, seção 2.3a).
 
 ### 2.6 Paginação
 
-`limit`/`offset` no corpo da requisição, com `limit` máximo configurável por schema. Para exports grandes, considerar um modo `format: "csv_stream"` que baixa direto, fora do fluxo JSON paginado.
+`limit`/`offset` no corpo da requisição, com `limit` máximo configurável por schema. Para exports grandes, `format=csv` (seção 2.3a) baixa direto, fora do fluxo JSON paginado. Ele ainda materializa o resultado inteiro antes de responder; um modo `csv_stream` de verdade — que transmita as linhas conforme o banco as devolve, sem passar por cache nem pela fila — exige um port de execução por streaming e fica para um marco próprio.
 
 ---
 

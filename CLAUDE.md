@@ -85,6 +85,7 @@ chamadas com `await`. Rotas FastAPI são `async def` e chamam os use cases assí
 - Joins acontecem apenas entre fato e dimensões do mesmo dataset/datasource. Não existe join federado entre datasets diferentes.
 - Datasets com `datasource.type: elasticsearch` só suportam modelo plano (sem fato/dimensão) e são executados por um `QueryExecutor` dedicado, não pelo adapter SQLAlchemy.
 - `POST /v1/query` e `GET /v1/query` convergem para o mesmo objeto `QueryRequest` (domain) antes de chegar no use case — nenhuma lógica de negócio duplicada entre as duas rotas.
+- O **formato de saída** (JSON ou CSV) é negociado na borda HTTP e nunca entra no `QueryRequest`. `query_id` é o hash da requisição e serve de chave de cache e de identificador do job assíncrono; se o formato fizesse parte dela, a mesma consulta em JSON e em CSV viraria dois `query_id` distintos — cache e execução duplicados por uma diferença que não muda o SQL gerado. Formato é representação do resultado, não parte da consulta, e por isso vive em querystring/header, nunca no corpo.
 - Toda consulta pesada deve passar pelo caminho assíncrono (fila); o critério de "pesada" está descrito em `docs/escalabilidade.md`.
 
 ## Plano de execução sugerido (marcos)
@@ -134,6 +135,14 @@ Trabalhar um marco por vez; cada um deve ser testável e revisável isoladamente
 ### Marco 9 — Observabilidade
 - Log de queries lentas, taxa de acerto de cache, tamanho da fila de jobs pesados
 - Rate limiting por cliente
+
+### Marco 10 — Formato de saída em CSV (seção 2.3a do contrato)
+- Negociação de formato na borda HTTP: `?format=csv|json` > header `Accept` > JSON por omissão. O parâmetro existe além do `Accept` porque o caso de uso real do CSV é um link de download, e navegador manda `Accept: text/html`
+- `adapters/api/content_negotiation.py` e `adapters/api/csv_presenter.py` — módulos puros (sem FastAPI), como `query_params.py`; o CSV segue a RFC 4180 e é escrito com `csv.writer`, nunca com `join`
+- Nada muda em `domain/`, `application/` nem nos executores: `QueryResult` já é `columns` + `rows`. O único ponto de decisão por formato é `_completed_response()` em `adapters/api/routers/query.py` — se um marco futuro precisar tocar `execute_query.py` para acrescentar um formato, o desenho foi violado
+- `202`/`processing`, `failed` e todos os erros da seção 2.5 continuam em JSON, qualquer que seja o formato pedido
+- O `meta` da seção 2.3 sai em headers `X-*` na resposta CSV; `Column.format` (`"currency"`) é dica de apresentação e não é aplicado — o CSV leva o valor cru
+- **Ainda não é streaming**: as linhas são geradas sob demanda, mas o executor materializa o resultado inteiro. O `csv_stream` da seção 2.6 exige um port de execução por streaming, com desvio de cache e de fila — marco próprio
 
 ## Como pedir ao Claude Code para trabalhar em um marco
 

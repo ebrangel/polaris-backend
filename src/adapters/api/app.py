@@ -12,9 +12,11 @@ from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from adapters.api.content_negotiation import UnsupportedFormatError
 from adapters.api.errors import (
     domain_error_handler,
     http_exception_handler,
+    unsupported_format_handler,
     validation_error_handler,
 )
 from adapters.api.routers import admin as admin_router
@@ -90,6 +92,9 @@ def create_app(
     # de todos eles, então um handler só cobre a hierarquia inteira.
     app.add_exception_handler(DomainError, domain_error_handler)
     app.add_exception_handler(RequestValidationError, validation_error_handler)
+    # `?format=` inválido (seção 2.3a) não é erro de domínio — formato de saída é
+    # assunto exclusivo desta camada —, mas entra no mesmo envelope da seção 2.5.
+    app.add_exception_handler(UnsupportedFormatError, unsupported_format_handler)
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)
 
     app.include_router(catalog_router.router)

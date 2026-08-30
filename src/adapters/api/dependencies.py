@@ -8,8 +8,9 @@ Marco 2.
 
 from typing import Annotated
 
-from fastapi import Depends, Header, HTTPException, Request
+from fastapi import Depends, Header, HTTPException, Query, Request
 
+from adapters.api.content_negotiation import OutputFormat, resolve_output_format
 from application.ports.catalog_repository import CatalogRepository
 from application.ports.job_queue import JobQueue
 from application.use_cases.execute_query import ExecuteQuery
@@ -83,11 +84,35 @@ def get_client_id(
     return f"ip:{host}"
 
 
+def get_output_format(
+    format_: Annotated[
+        str | None,
+        Query(
+            alias="format",
+            description=(
+                "Formato da resposta: `json` (padrão) ou `csv`. Tem precedência sobre "
+                "o header `Accept`. Não faz parte da consulta — não entra no "
+                "`query_id` nem na chave de cache."
+            ),
+        ),
+    ] = None,
+    accept: Annotated[str | None, Header()] = None,
+) -> OutputFormat:
+    """Formato de saída negociado (seção 2.3a), para `POST`/`GET /v1/query` e
+    `GET /v1/query/{query_id}`.
+
+    É uma dependência, e não um parâmetro de cada rota, para que as três entradas
+    negociem do mesmo jeito e o `?format=` apareça no OpenAPI das três.
+    """
+    return resolve_output_format(format_, accept)
+
+
 CatalogDep = Annotated[Catalog, Depends(get_catalog)]
 ExecuteQueryDep = Annotated[ExecuteQuery, Depends(get_execute_query)]
 JobQueueDep = Annotated[JobQueue, Depends(get_job_queue)]
 RolesDep = Annotated[tuple[str, ...], Depends(get_roles)]
 ClientIdDep = Annotated[str, Depends(get_client_id)]
+OutputFormatDep = Annotated[OutputFormat, Depends(get_output_format)]
 PublishCatalogDep = Annotated[PublishCatalog, Depends(get_publish_catalog)]
 CatalogRepositoryDep = Annotated[CatalogRepository, Depends(get_catalog_repository)]
 ObservabilitySnapshotDep = Annotated[
