@@ -2,10 +2,14 @@
 (`infrastructure/config.py`, `infrastructure/db.py`).
 
 Separado de `main.py` (que fica só com o `if PROCESS_ROLE == ...`) de propósito:
-`main.py` executa a montagem como efeito colateral do import (é o que permite
-`uvicorn main:app`/`arq main.WorkerSettings`), então nada mais pode importar `main.py`
-sem pagar esse custo. `scripts/publish_catalog.py` importa só deste módulo —
+`main.py` constrói a app/o `WorkerSettings` como efeito colateral do import (é o que
+permite `uvicorn main:app`/`arq main.WorkerSettings`), então nada mais pode importar
+`main.py` sem pagar esse custo. `scripts/publish_catalog.py` importa só deste módulo —
 `build_context`/`build_inspectors` sem nenhum efeito colateral de import.
+
+As duas fábricas (`create_application`, `create_worker_settings`) são síncronas: o
+uvicorn importa `main:app` de dentro do event loop dele, onde `asyncio.run()` estoura.
+O I/O do boot fica no `lifespan` da app e no `on_startup` do worker.
 """
 
 import asyncio
@@ -127,104 +131,128 @@ def build_inspectors(context: ApplicationContext) -> dict[str, DatasourceInspect
 
 
 def _build_lifespan(
-    context: ApplicationContext,
+    settings: Settings,
 ) -> Callable[[FastAPI], "contextlib._AsyncGeneratorContextManager[None]"]:
-    """Assina `catalog:invalidate` durante toda a vida do processo e troca
-    `app.state.catalog` a cada evento — "recarreguem o catálogo em memória
+    """Monta tudo o que depende de I/O e preenche `app.state`.
+
+    A montagem inteira mora aqui, e não no corpo de `create_application`, porque ela é
+    assíncrona (lê o catálogo ativo do Postgres, abre o pool do Redis) e o entry point
+    `uvicorn main:app` importa `main.py` **já dentro do event loop do servidor** — um
+    `asyncio.run()` no import estoura com "cannot be called from a running event loop".
+    O `lifespan` é o gancho do FastAPI feito para isso: roda no loop do servidor, antes
+    da primeira requisição, e o `finally` fecha na ordem inversa o que foi aberto.
+
+    Além da montagem, assina `catalog:invalidate` durante toda a vida do processo e
+    troca `app.state.catalog` a cada evento — "recarreguem o catálogo em memória
     imediatamente, em vez de depender de polling periódico" (`docs/pipeline-publicacao.md`).
     """
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        sub_client = Redis.from_url(context.settings.redis_url, decode_responses=True)
+        context = await build_context(settings)
+
+        cache_client = Redis.from_url(settings.redis_url, decode_responses=True)
+        cache = RedisCacheGateway(cache_client, default_ttl_seconds=settings.cache_ttl_seconds)
+
+        job_queue_pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
+        job_queue = ArqJobQueue(job_queue_pool)
+
+        # Duas instâncias do mesmo adapter, config diferente — mesmo padrão de
+        # `executors`, um port com várias instâncias por chave (Marco 9).
+        request_rate_limiter = RedisRateLimiter(
+            cache_client,
+            limit=settings.request_rate_limit,
+            window_seconds=settings.request_rate_limit_window_seconds,
+            key_prefix="ratelimit:request:",
+        )
+        heavy_query_rate_limiter = RedisRateLimiter(
+            cache_client,
+            limit=settings.heavy_query_rate_limit,
+            window_seconds=settings.heavy_query_rate_limit_window_seconds,
+            key_prefix="ratelimit:heavy:",
+        )
+
+        pubsub_client = Redis.from_url(settings.redis_url, decode_responses=True)
+        invalidator_client = Redis.from_url(settings.redis_url, decode_responses=True)
+
+        app.state.catalog = context.catalog
+        app.state.catalog_repository = context.catalog_repository
+        app.state.job_queue = job_queue
+        app.state.execute_query = ExecuteQuery(
+            catalog=context.catalog,
+            resolve_dataset=ResolveDataset(),
+            executors=context.executors,
+            cache=cache,
+            job_queue=job_queue,
+            cache_ttl_seconds=settings.cache_ttl_seconds,
+            request_rate_limiter=request_rate_limiter,
+            heavy_query_rate_limiter=heavy_query_rate_limiter,
+            max_heavy_queue_depth=settings.max_heavy_queue_depth,
+            slow_query_threshold_ms=settings.slow_query_threshold_ms,
+        )
+        app.state.publish_catalog = PublishCatalog(
+            repository=context.catalog_repository,
+            inspectors=build_inspectors(context),
+            invalidator=RedisCatalogInvalidator(invalidator_client),
+        )
+        app.state.get_observability_snapshot = GetObservabilitySnapshot(
+            cache=cache, job_queue=job_queue
+        )
+
         load_catalog = LoadCatalog(context.catalog_repository)
 
         async def on_invalidate(schema_name: str) -> None:
             app.state.catalog = await load_catalog()
 
-        task = asyncio.create_task(listen_for_invalidation(sub_client, on_invalidate))
+        task = asyncio.create_task(listen_for_invalidation(pubsub_client, on_invalidate))
         try:
             yield
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
-            await sub_client.aclose()
+            await pubsub_client.aclose()
+            await invalidator_client.aclose()
+            await cache_client.aclose()
+            await job_queue_pool.aclose()
             await context.dispose()
 
     return lifespan
 
 
-async def create_application() -> FastAPI:
+def create_application() -> FastAPI:
+    """Composition root da API — **síncrono de propósito**: `uvicorn main:app` importa o
+    módulo de dentro do seu event loop, então nada aqui pode ser `await`ado no import.
+    O que precisa de I/O vai para o `lifespan` (acima); aqui ficam só a leitura das env
+    vars e a construção da app.
+    """
     settings = load_settings()
     _configure_logging(settings)
-    context = await build_context(settings)
-
-    cache_client = Redis.from_url(settings.redis_url, decode_responses=True)
-    cache = RedisCacheGateway(cache_client, default_ttl_seconds=settings.cache_ttl_seconds)
-
-    job_queue_pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
-    job_queue = ArqJobQueue(job_queue_pool)
-
-    # Duas instâncias do mesmo adapter, config diferente — mesmo padrão de
-    # `executors`, um port com várias instâncias por chave (Marco 9).
-    request_rate_limiter = RedisRateLimiter(
-        cache_client,
-        limit=settings.request_rate_limit,
-        window_seconds=settings.request_rate_limit_window_seconds,
-        key_prefix="ratelimit:request:",
-    )
-    heavy_query_rate_limiter = RedisRateLimiter(
-        cache_client,
-        limit=settings.heavy_query_rate_limit,
-        window_seconds=settings.heavy_query_rate_limit_window_seconds,
-        key_prefix="ratelimit:heavy:",
-    )
-
-    execute_query = ExecuteQuery(
-        catalog=context.catalog,
-        resolve_dataset=ResolveDataset(),
-        executors=context.executors,
-        cache=cache,
-        job_queue=job_queue,
-        cache_ttl_seconds=settings.cache_ttl_seconds,
-        request_rate_limiter=request_rate_limiter,
-        heavy_query_rate_limiter=heavy_query_rate_limiter,
-        max_heavy_queue_depth=settings.max_heavy_queue_depth,
-        slow_query_threshold_ms=settings.slow_query_threshold_ms,
-    )
-
-    invalidator = RedisCatalogInvalidator(
-        Redis.from_url(settings.redis_url, decode_responses=True)
-    )
-    publish_catalog = PublishCatalog(
-        repository=context.catalog_repository,
-        inspectors=build_inspectors(context),
-        invalidator=invalidator,
-    )
-
-    get_observability_snapshot = GetObservabilitySnapshot(cache=cache, job_queue=job_queue)
-
     return create_app(
-        catalog=context.catalog,
-        execute_query=execute_query,
-        job_queue=job_queue,
-        publish_catalog=publish_catalog,
-        catalog_repository=context.catalog_repository,
-        get_observability_snapshot=get_observability_snapshot,
         internal_token=settings.internal_token,
-        lifespan=_build_lifespan(context),
+        include_admin=True,
+        include_observability=True,
+        lifespan=_build_lifespan(settings),
     )
 
 
-async def create_worker_settings() -> type:
+def create_worker_settings() -> type:
+    """Mesma divisão da API: síncrono no import, I/O no `on_startup` do arq — que roda
+    no loop do worker, e não num loop temporário que morre logo depois (deixando para
+    trás engines com conexões presas a um loop fechado).
+    """
     settings = load_settings()
     _configure_logging(settings)
-    context = await build_context(settings)
-    run_queued_query = RunQueuedQuery(
-        catalog=context.catalog,
-        executors=context.executors,
-        slow_query_threshold_ms=settings.slow_query_threshold_ms,
+
+    async def provide_run_queued_query() -> RunQueuedQuery:
+        context = await build_context(settings)
+        return RunQueuedQuery(
+            catalog=context.catalog,
+            executors=context.executors,
+            slow_query_threshold_ms=settings.slow_query_threshold_ms,
+        )
+
+    return build_worker_settings(
+        run_queued_query_provider=provide_run_queued_query,
+        redis_settings=RedisSettings.from_dsn(settings.redis_url),
     )
-    redis_settings = RedisSettings.from_dsn(settings.redis_url)
-    return build_worker_settings(run_queued_query, redis_settings)

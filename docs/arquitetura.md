@@ -168,10 +168,22 @@ a ordem de iteração de um `set` de strings variaria entre processos e o hash s
 
 ### `bootstrap.py` separado de `main.py`
 
-`main.py` executa a montagem como **efeito colateral do import** — é o que permite
+`main.py` constrói a app como **efeito colateral do import** — é o que permite
 `uvicorn main:app`. Logo, nada mais pode importar `main.py` sem pagar esse custo.
 
 `scripts/publish_catalog.py` importa só de `infrastructure/bootstrap.py`, sem efeito colateral.
+
+### A montagem com I/O acontece no `lifespan`, não no import
+
+`create_application()` é síncrono e só monta a app vazia: o uvicorn importa `main:app` de dentro do
+event loop dele (`Server.serve` → `config.load()`), então um `asyncio.run()` no import falha com
+*"asyncio.run() cannot be called from a running event loop"*.
+
+Quem lê o catálogo do Postgres, abre os pools do Redis e injeta os use cases em `app.state` é o
+`lifespan` — que roda no loop do servidor, antes da primeira requisição, e desmonta tudo na saída.
+As dependências de `dependencies.py` já liam `app.state` a cada requisição, então nada mais mudou.
+O worker tem a mesma divisão: `create_worker_settings()` é síncrono e o `on_startup` do arq monta o
+`RunQueuedQuery` já no loop do worker.
 
 ### O script de publicação tem fiação própria
 

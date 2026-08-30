@@ -5,6 +5,7 @@ worker executa para cada job. Ela só desserializa/serializa e delega — a lóg
 negócio é inteiramente do use case, testável sem Redis nem worker algum.
 """
 
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from adapters.serialization import dict_to_request, result_to_dict
@@ -23,19 +24,35 @@ async def run_heavy_query(ctx: dict[str, Any], request_dict: dict, dataset_name:
 
 
 def build_worker_settings(
-    run_queued_query: RunQueuedQuery,
-    redis_settings: Any,
+    run_queued_query: RunQueuedQuery | None = None,
+    redis_settings: Any = None,
     queue_name: str = "arq:queue",
+    *,
+    run_queued_query_provider: Callable[[], Awaitable[RunQueuedQuery]] | None = None,
 ) -> type:
     """`WorkerSettings` que `arq.worker.run_worker`/o CLI `arq` esperam.
 
     Só a forma: fiar com dependências reais (engines por datasource, catálogo lido do
     Postgres) — para popular `run_queued_query` de verdade — é do composition root
     (Marco 8), que chama esta fábrica já com tudo montado.
+
+    O composition root passa `run_queued_query_provider` em vez do use case pronto:
+    montá-lo exige I/O (ler o catálogo do Postgres) e o CLI `arq main.WorkerSettings`
+    importa o módulo antes de existir event loop algum. O provider é aguardado dentro do
+    `on_startup`, já no loop do worker. Quem monta o use case sem I/O — os testes —
+    continua passando `run_queued_query` direto.
     """
+    if (run_queued_query is None) == (run_queued_query_provider is None):
+        raise ValueError(
+            "Informe exatamente um entre `run_queued_query` e `run_queued_query_provider`."
+        )
 
     async def _on_startup(ctx: dict[str, Any]) -> None:
-        ctx[_CTX_KEY] = run_queued_query
+        ctx[_CTX_KEY] = (
+            run_queued_query
+            if run_queued_query_provider is None
+            else await run_queued_query_provider()
+        )
 
     # Nomes diferentes das variáveis externas vs. dos atributos de classe abaixo, de
     # propósito: `atributo = atributo` dentro de um corpo de classe não enxerga a

@@ -32,13 +32,15 @@ from domain.models import Catalog
 
 def create_app(
     *,
-    catalog: Catalog,
-    execute_query: ExecuteQuery,
-    job_queue: JobQueue,
+    catalog: Catalog | None = None,
+    execute_query: ExecuteQuery | None = None,
+    job_queue: JobQueue | None = None,
     publish_catalog: PublishCatalog | None = None,
     catalog_repository: CatalogRepository | None = None,
     get_observability_snapshot: GetObservabilitySnapshot | None = None,
     internal_token: str | None = None,
+    include_admin: bool | None = None,
+    include_observability: bool | None = None,
     lifespan: Callable[[FastAPI], AbstractAsyncContextManager[None]] | None = None,
 ) -> FastAPI:
     """`publish_catalog`/`catalog_repository`/`get_observability_snapshot`/
@@ -49,7 +51,23 @@ def create_app(
     `lifespan` é onde `main.py` pluga o assinante do pub/sub (`listen_for_invalidation`,
     Marco 8) como uma task de fundo — este adapter não sabe nada sobre Redis, só
     encaminha o gerenciador de contexto para o `FastAPI` de verdade.
+
+    **Peças ausentes na construção**: `catalog`/`execute_query`/`job_queue` também
+    aceitam `None` porque o composition root não consegue montá-las durante o import — a
+    montagem é assíncrona (lê o catálogo do Postgres, abre o pool do Redis) e
+    `uvicorn main:app` importa o módulo já dentro de um event loop. Ele então constrói a
+    app sem estado e preenche `app.state` no `lifespan`, que é o ponto do ciclo de vida
+    do FastAPI em que dá para usar `await`. As dependências de `dependencies.py` leem
+    `app.state` a cada requisição, e o `lifespan` termina antes da primeira delas.
+    Nesse caso os routers opcionais não podem ser inferidos das peças recebidas, então
+    `include_admin`/`include_observability` declaram a montagem explicitamente; quando
+    omitidos, vale a inferência de sempre (a peça correspondente foi passada ou não).
     """
+    if include_admin is None:
+        include_admin = publish_catalog is not None and catalog_repository is not None
+    if include_observability is None:
+        include_observability = get_observability_snapshot is not None
+
     app = FastAPI(
         title="API de consultas analíticas multi-banco",
         version="1.0.0",
@@ -76,8 +94,8 @@ def create_app(
 
     app.include_router(catalog_router.router)
     app.include_router(query_router.router)
-    if publish_catalog is not None and catalog_repository is not None:
+    if include_admin:
         app.include_router(admin_router.router)
-    if get_observability_snapshot is not None:
+    if include_observability:
         app.include_router(observability_router.router)
     return app

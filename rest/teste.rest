@@ -1,0 +1,27 @@
+GET http://localhost:8000/v1/catalog
+
+
+###
+POST http://localhost:8000/v1/query HTTP/1.1
+content-type: application/json
+
+{
+    "schema": "estoque",
+    "dimensions": ["filial"],
+    "measures": ["quantidade_disponivel"]
+}
+
+###
+# Opção A — o mesmo JSON do POST, url-encoded (paridade total)
+GET http://localhost:8000/v1/query
+?query=%7B%22schema%22%3A%22vendas%22%2C%22dimensions%22%3A%5B%22sigla_uf%22%5D%7D
+
+###
+# Opção B — parâmetros planos, para curl e links de dashboard
+GET http://localhost:8000/v1/query
+?schema=vendas
+&dimensions=sigla_uf,cargo
+&measures=valor_total
+&filter[sigla_uf][in]=SP,RJ
+&order_by=valor_total.desc
+&limit=100

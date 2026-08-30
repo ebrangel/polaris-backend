@@ -7,9 +7,14 @@
 
 Os dois entry points importam este módulo inteiro; sem o `PROCESS_ROLE`, o import de
 qualquer um dos dois bootaria a montagem inteira duas vezes (conexões dobradas).
+
+As duas fábricas são **síncronas**, e isso é obrigatório: o uvicorn importa `main:app`
+de dentro do event loop dele (`Server.serve` → `config.load()`), então um `asyncio.run()`
+aqui estouraria com "asyncio.run() cannot be called from a running event loop". Todo o
+I/O do boot (catálogo do Postgres, pools do Redis, engines por datasource) acontece no
+`lifespan` da app e no `on_startup` do worker, já dentro do loop de cada processo.
 """
 
-import asyncio
 import os
 import sys
 from pathlib import Path
@@ -21,8 +26,8 @@ from infrastructure.bootstrap import create_application, create_worker_settings 
 _role = os.environ.get("PROCESS_ROLE", "api")
 
 if _role == "api":
-    app = asyncio.run(create_application())
+    app = create_application()
 elif _role == "worker":
-    WorkerSettings = asyncio.run(create_worker_settings())
+    WorkerSettings = create_worker_settings()
 else:
     raise RuntimeError(f"PROCESS_ROLE desconhecido: {_role!r} — use 'api' ou 'worker'.")
