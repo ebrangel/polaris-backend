@@ -87,6 +87,7 @@ chamadas com `await`. Rotas FastAPI são `async def` e chamam os use cases assí
 - `POST /v1/query` e `GET /v1/query` convergem para o mesmo objeto `QueryRequest` (domain) antes de chegar no use case — nenhuma lógica de negócio duplicada entre as duas rotas.
 - O **formato de saída** (JSON ou CSV) é negociado na borda HTTP e nunca entra no `QueryRequest`. `query_id` é o hash da requisição e serve de chave de cache e de identificador do job assíncrono; se o formato fizesse parte dela, a mesma consulta em JSON e em CSV viraria dois `query_id` distintos — cache e execução duplicados por uma diferença que não muda o SQL gerado. Formato é representação do resultado, não parte da consulta, e por isso vive em querystring/header, nunca no corpo.
 - Toda consulta pesada deve passar pelo caminho assíncrono (fila); o critério de "pesada" está descrito em `docs/escalabilidade.md`.
+- Quem materializa resultado grande é o **worker**, nunca o processo da API: todo job pesado concluído grava um CSV via o port `ResultExporter`, e a API só entrega o arquivo pronto em `GET /v1/query/{query_id}/download`. O export é gerado para todo job, e não só para quem pediu CSV — o `arq` deduplica por `query_id`, então condicionar o arquivo à intenção do cliente perderia a intenção da segunda de duas requisições idênticas.
 
 ## Plano de execução sugerido (marcos)
 
@@ -138,11 +139,20 @@ Trabalhar um marco por vez; cada um deve ser testável e revisável isoladamente
 
 ### Marco 10 — Formato de saída em CSV (seção 2.3a do contrato)
 - Negociação de formato na borda HTTP: `?format=csv|json` > header `Accept` > JSON por omissão. O parâmetro existe além do `Accept` porque o caso de uso real do CSV é um link de download, e navegador manda `Accept: text/html`
-- `adapters/api/content_negotiation.py` e `adapters/api/csv_presenter.py` — módulos puros (sem FastAPI), como `query_params.py`; o CSV segue a RFC 4180 e é escrito com `csv.writer`, nunca com `join`
+- `adapters/api/content_negotiation.py`, `adapters/api/csv_presenter.py` (headers HTTP) e `adapters/csv_format.py` (a escrita em si, compartilhada com o worker desde o Marco 11) — módulos puros, sem FastAPI, como `query_params.py`; o CSV segue a RFC 4180 e é escrito com `csv.writer`, nunca com `join`
 - Nada muda em `domain/`, `application/` nem nos executores: `QueryResult` já é `columns` + `rows`. O único ponto de decisão por formato é `_completed_response()` em `adapters/api/routers/query.py` — se um marco futuro precisar tocar `execute_query.py` para acrescentar um formato, o desenho foi violado
 - `202`/`processing`, `failed` e todos os erros da seção 2.5 continuam em JSON, qualquer que seja o formato pedido
 - O `meta` da seção 2.3 sai em headers `X-*` na resposta CSV; `Column.format` (`"currency"`) é dica de apresentação e não é aplicado — o CSV leva o valor cru
 - **Ainda não é streaming**: as linhas são geradas sob demanda, mas o executor materializa o resultado inteiro. O `csv_stream` da seção 2.6 exige um port de execução por streaming, com desvio de cache e de fila — marco próprio
+
+### Marco 11 — Export de consulta pesada (seção 2.4a do contrato)
+- Port `ResultExporter` (`export`/`stat`/`open`/`purge_expired`) + `LocalFileResultExporter`: um arquivo `<EXPORT_DIR>/<query_id>.csv` por job concluído, escrito pelo worker e servido pela API
+- **O port recebe `QueryResult`, não linhas de CSV já formatadas.** Quem chama é `RunQueuedQuery`, em `application/`, que não pode importar `adapters/` — e CSV é formato, assunto de adapter. Por isso o port é um *exportador* (formata e persiste), e não um *armazenamento*
+- `adapters/csv_format.py` guarda o escritor de CSV compartilhado entre a API e o worker, pelo mesmo motivo de `adapters/serialization.py` já ser compartilhado entre cache e fila: um adapter de fila não pode depender de um adapter de HTTP
+- `download_url`/`download_expires_at` são transporte, montados pelo router a partir do `ExportMetadata` — como o `poll_url`, não existem no `QueryResult` do domínio
+- TTL autoritativo na **leitura** (`stat()` recusa vencido na hora), com o cron do worker cuidando só do espaço em disco. `open()` abre o descritor antes de devolver o gerador, para que a varredura não trunque download em andamento
+- Falha de export não derruba o job: o resultado já foi calculado e volta pela fila do mesmo jeito
+- Limitação conhecida: com adapter de filesystem, API e worker precisam do mesmo `EXPORT_DIR`. Um adapter de S3 entra sem mudar o contrato HTTP — a URL de download continua sendo a da própria API
 
 ## Como pedir ao Claude Code para trabalhar em um marco
 

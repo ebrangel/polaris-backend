@@ -5,11 +5,13 @@ Marco 2 não quer acoplar `adapters/` a `application/`). O Marco 4 reutiliza est
 para testar a orquestração do use case `ExecuteQuery` sem nenhum banco real.
 """
 
-from datetime import UTC, datetime
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 
 from application.catalog_codec import decompile_schema
 from application.ports.cache_gateway import CacheStats
 from application.ports.query_executor import ExecutionProfile, QueryCost
+from application.ports.result_exporter import ExportMetadata
 from domain.models import CatalogVersion, Dataset, QueryRequest, QueryResult, QueryStatus
 
 
@@ -154,6 +156,79 @@ class InMemoryCatalogInvalidator:
 
     async def publish(self, schema_name: str) -> None:
         self.published.append(schema_name)
+
+
+class InMemoryResultExporter:
+    """Fake do `ResultExporter`: os "arquivos" são bytes num dict.
+
+    `expire()` e `raises` deixam os testes exercitarem os dois caminhos que no adapter
+    real dependem de relógio e de disco — export vencido e falha de escrita.
+    """
+
+    def __init__(self, ttl_seconds: int = 86_400, *, raises: Exception | None = None) -> None:
+        self._ttl = timedelta(seconds=ttl_seconds)
+        self.raises = raises
+        self._files: dict[str, bytes] = {}
+        self._created: dict[str, datetime] = {}
+        self.calls: list[str] = []
+        #: `query_id`s que `open()` deve fingir que sumiram entre o `stat()` e a leitura.
+        self.vanished: set[str] = set()
+
+    def _metadata(self, query_id: str) -> ExportMetadata:
+        created_at = self._created[query_id]
+        return ExportMetadata(
+            query_id=query_id,
+            size_bytes=len(self._files[query_id]),
+            created_at=created_at,
+            expires_at=created_at + self._ttl,
+        )
+
+    async def export(self, result: QueryResult) -> ExportMetadata:
+        self.calls.append(result.query_id)
+        if self.raises is not None:
+            raise self.raises
+        if result.status is not QueryStatus.COMPLETED:
+            raise ValueError("só resultados com status=completed são exportáveis")
+
+        from adapters.csv_format import csv_lines  # import local: o fake não é adapter
+
+        self._files[result.query_id] = "".join(csv_lines(result)).encode("utf-8")
+        self._created[result.query_id] = datetime.now(UTC)
+        return self._metadata(result.query_id)
+
+    async def stat(self, query_id: str) -> ExportMetadata | None:
+        if query_id not in self._files:
+            return None
+        metadata = self._metadata(query_id)
+        if metadata.expires_at <= datetime.now(UTC):
+            return None
+        return metadata
+
+    async def open(self, query_id: str) -> AsyncIterator[bytes]:
+        if query_id in self.vanished or query_id not in self._files:
+            raise FileNotFoundError(query_id)
+        content = self._files[query_id]
+
+        async def chunks() -> AsyncIterator[bytes]:
+            yield content
+
+        return chunks()
+
+    async def purge_expired(self) -> int:
+        now = datetime.now(UTC)
+        expired = [
+            query_id
+            for query_id, created in self._created.items()
+            if created + self._ttl <= now
+        ]
+        for query_id in expired:
+            del self._files[query_id]
+            del self._created[query_id]
+        return len(expired)
+
+    def expire(self, query_id: str) -> None:
+        """Auxiliar de teste: envelhece o arquivo para além do TTL."""
+        self._created[query_id] = datetime.now(UTC) - self._ttl - timedelta(seconds=1)
 
 
 class InMemoryJobQueue:

@@ -325,6 +325,61 @@ Retornado com HTTP `202 Accepted`. O cliente então consulta `GET /v1/query/{que
 
 Critério sugerido para decidir síncrono vs. assíncrono: depois de resolver o dataset, estimar custo da query (cardinalidade das dimensões e ausência de filtros seletivos, específico do datasource daquele dataset) antes de executar; acima de um limiar, enfileirar.
 
+### 2.4a Export de consulta pesada — arquivo e URL de download
+
+Toda consulta que passa pela fila e conclui deixa um **arquivo CSV** para trás, gravado
+pelo worker. Quem executa a consulta pesada é o processo com orçamento de memória para
+ela; a API só entrega o arquivo pronto, sem nunca segurar o resultado inteiro para
+servir um export.
+
+O arquivo é gerado para **todo** job concluído, e não só para quem pediu CSV. O motivo é
+o mesmo que mantém `format` fora do `query_id` (seção 2.3a): o job é deduplicado por
+`query_id`, então duas requisições idênticas — uma em JSON, outra em CSV — compartilham
+um job só, e condicionar o export à intenção do cliente perderia a intenção da segunda
+sem aviso.
+
+Concluída a consulta, o corpo da seção 2.3 ganha duas chaves:
+
+```json
+{
+  "query_id": "q_9d31be",
+  "status": "completed",
+  "columns": [ ... ],
+  "rows": [ ... ],
+  "meta": { ... },
+  "download_url": "/v1/query/q_9d31be/download",
+  "download_expires_at": "2026-08-31T14:02:11+00:00"
+}
+```
+
+Como o `poll_url`, as duas são detalhe de transporte: não existem no resultado em si, e
+não aparecem numa consulta síncrona — que nunca passou pelo worker e portanto não tem
+arquivo.
+
+```
+GET /v1/query/{query_id}/download
+
+200 OK
+Content-Type: text/csv; charset=utf-8; header=present
+Content-Disposition: attachment; filename="q_9d31be.csv"
+Content-Length: 48210934
+X-Query-Id: q_9d31be
+```
+
+O conteúdo é o mesmo CSV da seção 2.3a. Esta rota não consulta a fila nem o cache — o
+arquivo é a fonte, e sobrevive ao TTL da entrada do job. Por isso ela não traz os
+headers de `meta` (`X-Dataset-Used`, `X-Execution-Ms`): esses vêm de
+`GET /v1/query/{query_id}`, enquanto o job existir.
+
+`GET /v1/query/{query_id}?format=csv` serve o arquivo quando ele existe, e só renderiza
+do resultado em memória quando não existe.
+
+**Retenção.** Cada arquivo vale por `EXPORT_TTL_SECONDS` (24 h por omissão). Um arquivo
+vencido deixa de ser servido no instante em que vence, independentemente de quando a
+varredura periódica do worker passa por ele. Download de arquivo inexistente, vencido, ou
+de um servidor sem export configurado responde `404 export_not_found` — os três casos são
+a mesma informação para o cliente: não há arquivo para baixar.
+
 ### 2.5 Erros
 
 Formato único de erro (estilo `application/problem+json`):
@@ -339,7 +394,7 @@ Formato único de erro (estilo `application/problem+json`):
 }
 ```
 
-Tipos de erro previstos: `unknown_schema`, `unknown_field`, `invalid_filter`, `forbidden_measure` (quando o role do usuário não tem acesso à medida), `no_dataset_available` (nenhum dataset cobre a combinação pedida), `query_timeout`, `rate_limited`, `invalid_format` (valor de `format` que a API não produz, seção 2.3a).
+Tipos de erro previstos: `unknown_schema`, `unknown_field`, `invalid_filter`, `forbidden_measure` (quando o role do usuário não tem acesso à medida), `no_dataset_available` (nenhum dataset cobre a combinação pedida), `query_timeout`, `rate_limited`, `invalid_format` (valor de `format` que a API não produz, seção 2.3a), `export_not_found` (não há arquivo para download, seção 2.4a).
 
 ### 2.6 Paginação
 

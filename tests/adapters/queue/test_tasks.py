@@ -2,9 +2,12 @@
 Redis: a task é um shim fino sobre `RunQueuedQuery`, testável isoladamente.
 """
 
-from adapters.queue.tasks import build_worker_settings, run_heavy_query
+import pytest
+
+from adapters.queue.tasks import build_worker_settings, purge_exports, run_heavy_query
 from adapters.serialization import request_to_dict
 from domain.models import Column, DataType, QueryRequest, QueryResult
+from fakes import InMemoryResultExporter
 
 
 class _FakeRunQueuedQuery:
@@ -77,3 +80,77 @@ async def test_ciclo_completo_enqueue_shape_ate_o_shim():
     body = await settings.functions[0](ctx, request_to_dict(request), "vendas_agregado_uf")
 
     assert body["status"] == "completed"
+
+
+# --- Varredura de exports (seção 2.4a) --------------------------------------------------
+
+
+async def test_purge_exports_delega_para_o_exportador():
+    exporter = InMemoryResultExporter(ttl_seconds=3600)
+    result = QueryResult.completed(
+        query_id="q_8f2a1c",
+        columns=(Column(field="sigla_uf", type=DataType.STRING),),
+        rows=(("SP",),),
+        dataset_used="vendas_agregado_uf",
+    )
+    await exporter.export(result)
+    exporter.expire("q_8f2a1c")
+
+    removidos = await purge_exports({"result_exporter": exporter})
+
+    assert removidos == 1
+    assert await exporter.stat("q_8f2a1c") is None
+
+
+async def test_cron_de_limpeza_registrado_quando_ha_exportador():
+    fake = _FakeRunQueuedQuery(QueryResult.processing("q_1"))
+    exporter = InMemoryResultExporter()
+
+    settings = build_worker_settings(
+        fake, redis_settings="fake-redis-settings", result_exporter=exporter
+    )
+
+    assert [job.coroutine for job in settings.cron_jobs] == [purge_exports]
+    ctx: dict = {}
+    await settings.on_startup(ctx)
+    assert ctx["result_exporter"] is exporter
+
+
+async def test_sem_exportador_nao_registra_cron():
+    """Um cron que só levantaria `KeyError` no `ctx` é pior que cron nenhum."""
+    fake = _FakeRunQueuedQuery(QueryResult.processing("q_1"))
+
+    settings = build_worker_settings(fake, redis_settings="fake-redis-settings")
+
+    assert settings.cron_jobs == []
+
+
+async def test_exportador_e_provider_juntos_sao_recusados():
+    fake = _FakeRunQueuedQuery(QueryResult.processing("q_1"))
+
+    async def provider():
+        return InMemoryResultExporter()
+
+    with pytest.raises(ValueError, match="no máximo um"):
+        build_worker_settings(
+            fake,
+            redis_settings="fake-redis-settings",
+            result_exporter=InMemoryResultExporter(),
+            result_exporter_provider=provider,
+        )
+
+
+async def test_provider_de_exportador_e_aguardado_no_startup():
+    fake = _FakeRunQueuedQuery(QueryResult.processing("q_1"))
+    exporter = InMemoryResultExporter()
+
+    async def provider():
+        return exporter
+
+    settings = build_worker_settings(
+        fake, redis_settings="fake-redis-settings", result_exporter_provider=provider
+    )
+    ctx: dict = {}
+    await settings.on_startup(ctx)
+
+    assert ctx["result_exporter"] is exporter

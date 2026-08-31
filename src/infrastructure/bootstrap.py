@@ -30,6 +30,7 @@ from adapters.cache.redis_pubsub import RedisCatalogInvalidator, listen_for_inva
 from adapters.cache.redis_rate_limiter import RedisRateLimiter
 from adapters.catalog.postgres_inspector import PostgresInspector
 from adapters.executors import ElasticsearchQueryExecutor, SQLAlchemyQueryExecutor
+from adapters.exports import LocalFileResultExporter
 from adapters.queue.arq_queue import ArqJobQueue
 from adapters.queue.tasks import build_worker_settings
 from adapters.repositories.postgres_catalog_repository import PostgresCatalogRepository
@@ -53,6 +54,15 @@ def _configure_logging(settings: Settings) -> None:
     """Chamado uma vez por processo (API ou worker) — sem isso, o log de consultas
     lentas (Marco 9) roda para um logger sem handler nenhum, e nada aparece."""
     logging.basicConfig(level=settings.log_level)
+
+
+def build_result_exporter(settings: Settings) -> LocalFileResultExporter:
+    """Construído igual nos dois processos, a partir da mesma configuração: o worker
+    escreve e varre, a API lê. É por isso que `EXPORT_DIR` precisa apontar para o mesmo
+    lugar nos dois — sem volume compartilhado, a API não acha o que o worker gravou."""
+    return LocalFileResultExporter(
+        settings.export_dir, ttl_seconds=settings.export_ttl_seconds
+    )
 
 
 @dataclass
@@ -178,6 +188,7 @@ def _build_lifespan(
         app.state.catalog = context.catalog
         app.state.catalog_repository = context.catalog_repository
         app.state.job_queue = job_queue
+        app.state.result_exporter = build_result_exporter(settings)
         app.state.execute_query = ExecuteQuery(
             catalog=context.catalog,
             resolve_dataset=ResolveDataset(),
@@ -244,15 +255,20 @@ def create_worker_settings() -> type:
     settings = load_settings()
     _configure_logging(settings)
 
+    result_exporter = build_result_exporter(settings)
+
     async def provide_run_queued_query() -> RunQueuedQuery:
         context = await build_context(settings)
         return RunQueuedQuery(
             catalog=context.catalog,
             executors=context.executors,
             slow_query_threshold_ms=settings.slow_query_threshold_ms,
+            result_exporter=result_exporter,
         )
 
     return build_worker_settings(
         run_queued_query_provider=provide_run_queued_query,
         redis_settings=RedisSettings.from_dsn(settings.redis_url),
+        # O mesmo exportador do use case: quem escreve os arquivos é quem os varre.
+        result_exporter=result_exporter,
     )

@@ -6,12 +6,16 @@ no momento do `enqueue` (seu nome viajou no payload do job), então este use cas
 `ResolveDataset` chama — só busca o dataset pelo nome e executa no perfil `HEAVY`.
 """
 
+import logging
 from collections.abc import Mapping
 
 from application.ports.query_executor import ExecutionProfile, QueryExecutor
+from application.ports.result_exporter import ResultExporter
 from application.use_cases._executor_lookup import executor_for
 from application.use_cases._slow_query_log import log_if_slow
-from domain.models import Catalog, QueryRequest, QueryResult
+from domain.models import Catalog, QueryRequest, QueryResult, QueryStatus
+
+logger = logging.getLogger(__name__)
 
 
 class RunQueuedQuery:
@@ -22,10 +26,15 @@ class RunQueuedQuery:
         catalog: Catalog,
         executors: Mapping[str, QueryExecutor],
         slow_query_threshold_ms: int | None = None,
+        result_exporter: ResultExporter | None = None,
     ) -> None:
+        """`result_exporter` é opcional pelo mesmo motivo de `slow_query_threshold_ms`
+        (Marco 9): sem ele o comportamento é o de antes do export — a consulta roda e o
+        resultado volta pela fila, só não fica um arquivo baixável para trás."""
         self._catalog = catalog
         self._executors = executors
         self._slow_query_threshold_ms = slow_query_threshold_ms
+        self._result_exporter = result_exporter
 
     async def __call__(self, request: QueryRequest, dataset_name: str) -> QueryResult:
         schema = self._catalog.get_schema(request.schema)
@@ -39,4 +48,28 @@ class RunQueuedQuery:
         log_if_slow(
             result, schema_name=schema.name, threshold_ms=self._slow_query_threshold_ms
         )
+        await self._export(result)
         return result
+
+    async def _export(self, result: QueryResult) -> None:
+        """Grava o arquivo baixável — **toda** consulta pesada concluída ganha um.
+
+        Não é condicionado a o cliente ter pedido CSV, e isso é proposital: o formato de
+        saída não faz parte da `QueryRequest` nem do `query_id` (seção 2.3a), e o `arq`
+        deduplica jobs por `_job_id=query_id`. Carregar a intenção de export no payload
+        faria duas requisições idênticas — uma em JSON, outra em CSV — colidirem no mesmo
+        job, e a intenção da segunda se perderia sem aviso. Escrever sempre custa um
+        arquivo a mais e elimina a classe de bug inteira.
+
+        Falha de export não derruba o job: o resultado já foi calculado e vale pela fila
+        do mesmo jeito — o cliente perde o link de download, não a resposta.
+        """
+        if self._result_exporter is None or result.status is not QueryStatus.COMPLETED:
+            return
+        try:
+            await self._result_exporter.export(result)
+        except Exception:
+            logger.warning(
+                "falha ao exportar o resultado da consulta %s", result.query_id,
+                exc_info=True,
+            )

@@ -45,6 +45,13 @@ class Settings:
     cache_ttl_seconds: int = 3600
     light_pool_size: int = 20
     heavy_pool_size: int = 3
+    # --- Export de consultas pesadas (seção 2.4a) -------------------------------------
+    #: Diretório onde o worker grava os CSV e de onde a API os serve. **Os dois
+    #: processos precisam enxergar o mesmo caminho** — mesmo host, ou volume
+    #: compartilhado (é a limitação do adapter de filesystem, ver
+    #: `adapters/exports/local_file_exporter.py`).
+    export_dir: str = "exports"
+    export_ttl_seconds: int = 86_400
     # --- Observabilidade (Marco 9) ---------------------------------------------------
     slow_query_threshold_ms: int = 2000
     request_rate_limit: int = 100
@@ -67,6 +74,8 @@ def load_settings() -> Settings:
         cache_ttl_seconds=int(os.environ.get("CACHE_TTL_SECONDS", "3600")),
         light_pool_size=int(os.environ.get("LIGHT_POOL_SIZE", "20")),
         heavy_pool_size=int(os.environ.get("HEAVY_POOL_SIZE", "3")),
+        export_dir=os.environ.get("EXPORT_DIR", "exports"),
+        export_ttl_seconds=int(os.environ.get("EXPORT_TTL_SECONDS", "86400")),
         slow_query_threshold_ms=int(os.environ.get("SLOW_QUERY_THRESHOLD_MS", "2000")),
         request_rate_limit=int(os.environ.get("REQUEST_RATE_LIMIT", "100")),
         request_rate_limit_window_seconds=int(

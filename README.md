@@ -99,6 +99,7 @@ POST /v1/query
       │      ├─ pesada ─► fila cheia? ───────────► 429 rate_limited
       │      │            limite do cliente? ────► 429 rate_limited
       │      │            senão ─────────────────► 202 processing + poll_url
+      │      │                                        (o worker executa e grava o CSV)
       │      └─ leve ─► executa (loga se lenta) ─► 200 completed
       └─ 7. grava no cache
 ```
@@ -272,6 +273,7 @@ Filial SP,45
 | `POST` | `/v1/query` | Executa ou enfileira uma consulta |
 | `GET` | `/v1/query` | Idem, via querystring |
 | `GET` | `/v1/query/{query_id}` | Status/resultado de uma consulta assíncrona |
+| `GET` | `/v1/query/{query_id}/download` | Baixa o CSV que o worker gravou para a consulta |
 
 `GET /v1/catalog/{schema}` devolve **apenas o modelo lógico** — datasets e roteamento são detalhe
 interno e não são expostos. As três rotas de consulta aceitam `?format=` e o header `Accept` para
@@ -379,31 +381,44 @@ saem em headers `X-*` — a observabilidade continua disponível para quem conso
 O `format` declarado na coluna (`"currency"`) é **dica de apresentação para o cliente e não é
 aplicado**: escrever `R$ 458.320,50` inutilizaria o arquivo para consumo programático.
 
-#### Consulta pesada em CSV
+#### Consulta pesada: o worker escreve o arquivo
 
 Três respostas nunca saem em CSV, qualquer que seja o formato pedido: o `202` de enfileiramento e o
 `status: processing` (`{query_id, status, poll_url}` não é uma tabela), o `status: failed`, e
 qualquer erro — que continua em `application/problem+json`.
 
-O download de um export grande é, então:
+Para export grande, o CSV não é renderizado pela API: **toda consulta que passa pela fila e conclui
+deixa um arquivo gravado pelo worker**, e a API só o entrega. O processo que atende as requisições
+nunca segura o resultado inteiro em memória, e o arquivo sobrevive ao TTL da entrada do job no Redis.
 
 ```bash
 # 1. submete — se for pesada, volta 202 em JSON
-curl -s -X POST 'localhost:8000/v1/query?format=csv' \
+curl -s -X POST localhost:8000/v1/query \
   -H 'Content-Type: application/json' \
   -d '{"schema":"vendas","dimensions":["sigla_uf","cargo"],"measures":["valor_total"]}' | jq
 # → { "query_id": "q_9d31be", "status": "processing", "poll_url": "/v1/query/q_9d31be" }
 
-# 2. acompanha em JSON
-curl -s localhost:8000/v1/query/q_9d31be | jq '.status'
+# 2. acompanha em JSON — ao concluir, o corpo traz o link
+curl -s localhost:8000/v1/query/q_9d31be | jq '{status, download_url, download_expires_at}'
+# → { "status": "completed",
+#     "download_url": "/v1/query/q_9d31be/download",
+#     "download_expires_at": "2026-08-31T14:02:11+00:00" }
 
-# 3. baixa em CSV quando concluir
-curl -s 'localhost:8000/v1/query/q_9d31be?format=csv' -o vendas.csv
+# 3. baixa o arquivo
+curl -s localhost:8000/v1/query/q_9d31be/download -o vendas.csv
 ```
 
-> **Ainda não é streaming.** As linhas são geradas sob demanda, mas o executor materializa o
-> resultado inteiro antes de responder. Um `csv_stream` de verdade exige um port de execução por
-> streaming, com desvio de cache e de fila — está fora do escopo atual.
+O arquivo é gerado para **todo** job concluído, não só para quem pediu CSV — o job é deduplicado por
+`query_id`, então duas requisições idênticas (uma em JSON, outra em CSV) compartilham um job só, e
+condicionar o export à intenção do cliente perderia a intenção da segunda sem aviso.
+
+Cada arquivo vale por `EXPORT_TTL_SECONDS` (24 h por omissão) e um cron do worker varre os vencidos.
+Download de arquivo inexistente, vencido, ou de um servidor sem export configurado responde `404
+export_not_found` — os três casos são a mesma informação para o cliente.
+
+> **`EXPORT_DIR` precisa ser o mesmo para a API e para o worker** — mesmo host, ou volume
+> compartilhado. É a limitação do adapter de filesystem; um adapter de S3 a resolve sem mudar nada no
+> contrato HTTP, porque a URL de download continua sendo a da própria API.
 
 ### Erros
 
@@ -432,6 +447,7 @@ Formato único, estilo `application/problem+json`:
 | `malformed_request` | 422 | Erro de forma (JSON/enum/tipo) |
 | `unknown_query` | 404 | `query_id` inexistente |
 | `invalid_format` | 422 | `?format=` com valor que a API não produz |
+| `export_not_found` | 404 | Não há arquivo para download (inexistente, vencido, ou export não configurado) |
 
 ---
 
@@ -519,9 +535,9 @@ ou `redis` dentro de `domain/` ou `application/` quebra a suíte.
              As setas de dependência apontam para dentro.
 ```
 
-Sete **ports** (`typing.Protocol`) isolam o núcleo da infraestrutura: `QueryExecutor`,
-`CacheGateway`, `JobQueue`, `CatalogRepository`, `DatasourceInspector`, `CatalogInvalidator` e
-`RateLimiter`. Cada um tem uma implementação real em `adapters/` e um fake in-memory em
+Oito **ports** (`typing.Protocol`) isolam o núcleo da infraestrutura: `QueryExecutor`,
+`CacheGateway`, `JobQueue`, `CatalogRepository`, `DatasourceInspector`, `CatalogInvalidator`,
+`RateLimiter` e `ResultExporter`. Cada um tem uma implementação real em `adapters/` e um fake in-memory em
 `tests/fakes.py`.
 
 Detalhamento — mapa de arquivos, decisões de projeto e como estender — em
@@ -544,11 +560,11 @@ Detalhamento — mapa de arquivos, decisões de projeto e como estender — em
 
 ## Testes
 
-**422 testes**, divididos entre rápidos e de integração:
+**467 testes**, divididos entre rápidos e de integração:
 
 ```bash
-uv run pytest -q -m "not integration"   # 375 testes, ~1,5 s, sem Docker
-uv run pytest -q                        # 422 testes, ~40 s, com containers reais
+uv run pytest -q -m "not integration"   # 420 testes, ~1,7 s, sem Docker
+uv run pytest -q                        # 467 testes, ~40 s, com containers reais
 ```
 
 Os testes de integração sobem **Postgres, Elasticsearch e Redis de verdade** via
@@ -562,6 +578,7 @@ está disponível e se autopula quando não está, então a suíte rápida roda 
 | SQL gerado, Query DSL, execução real | `tests/adapters/executors/` |
 | Contrato HTTP, envelope de erro, negociação de formato, rate limiting | `tests/adapters/api/` |
 | Cache, fila, pub/sub, rate limiter | `tests/adapters/cache/`, `tests/adapters/queue/` |
+| Export em disco, TTL e varredura | `tests/adapters/exports/` |
 | Repositório do catálogo e inspetores | `tests/adapters/repositories/`, `tests/adapters/catalog/` |
 | Regra de dependência entre camadas | `tests/test_layer_purity.py` |
 
@@ -590,10 +607,11 @@ documentação como objetos de domínio, e `tests/application/test_catalog_codec
 │   │   ├── executors/          # SQLAlchemy (Postgres/Oracle) e Elasticsearch
 │   │   ├── repositories/       # PostgresCatalogRepository
 │   │   ├── cache/              # Cache, pub/sub e rate limiter em Redis
-│   │   ├── queue/              # ArqJobQueue + task do worker
+│   │   ├── queue/              # ArqJobQueue + task do worker + cron de limpeza
+│   │   ├── exports/            # LocalFileResultExporter — CSV em disco, com TTL
 │   │   └── catalog/            # Leitor de YAML e inspetores de datasource
 │   └── infrastructure/         # config.py, db.py, bootstrap.py
-└── tests/                      # 422 testes (fakes + testcontainers)
+└── tests/                      # 467 testes (fakes + testcontainers)
 ```
 
 ---
@@ -626,8 +644,12 @@ observabilidade.
 - **Manifesto `dependencies.yaml`** para dimensões compartilhadas entre schemas — enquanto o
   catálogo for pequeno, schemas autocontidos são mais simples (recomendação do próprio doc de
   pipeline).
-- **Streaming de verdade no CSV** — `?format=csv` já existe e gera as linhas sob demanda, mas o
-  executor materializa o resultado inteiro antes de responder. O `csv_stream` da seção 2.6 exige um
-  port de execução por streaming, com desvio de cache e de fila.
+- **Adapter de S3 para os exports** — o port `ResultExporter` existe e o adapter de filesystem o
+  implementa; um de S3 entraria sem mudar contrato nenhum, e é o que libera deploy multi-nó sem
+  volume compartilhado.
+- **Streaming de verdade no caminho síncrono** — o export do worker resolve o problema de memória
+  para consulta pesada, mas `?format=csv` numa consulta leve ainda materializa o resultado. O
+  `csv_stream` da seção 2.6 exige um port de execução por streaming, e resolveria tempo até o
+  primeiro byte, não pico de memória.
 - **Delimitador configurável por requisição** — o presenter aceita `;` (o que o Excel em pt-BR
   espera), mas não há parâmetro HTTP para escolhê-lo; o padrão é a vírgula da RFC 4180.

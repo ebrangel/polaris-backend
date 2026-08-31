@@ -1,9 +1,13 @@
-"""`QueryResult` → CSV da RFC 4180 (seção 2.3a) — presenter puro, sem app."""
+"""`QueryResult` → CSV da RFC 4180 (seção 2.3a) — escritor puro, sem app.
+
+O mesmo `csv_lines` alimenta a resposta HTTP e o arquivo que o worker grava (seção
+2.4a), então estes casos valem para os dois caminhos.
+"""
 
 from datetime import date
 from decimal import Decimal
 
-from adapters.api.csv_presenter import csv_headers, csv_lines
+from adapters.csv_format import csv_lines
 from domain.models import Column, DataType, QueryResult
 
 
@@ -134,19 +138,17 @@ def test_delimitador_alternativo_para_excel():
     )
 
 
-def test_headers_carregam_o_meta_da_secao_2_3():
+def test_linhas_saem_uma_a_uma():
+    """É gerador, não string única: quem consome escreve no socket ou no arquivo sem
+    montar o CSV inteiro em memória."""
     result = _result(
         columns=(Column(field="sigla_uf", type=DataType.STRING),),
-        rows=(("SP",),),
-        cached=True,
-        execution_ms=12,
+        rows=(("SP",), ("RJ",), ("MG",)),
     )
 
-    assert csv_headers(result) == {
-        "Content-Disposition": 'attachment; filename="q_8f2a1c.csv"',
-        "X-Query-Id": "q_8f2a1c",
-        "X-Row-Count": "1",
-        "X-Cached": "true",
-        "X-Execution-Ms": "12",
-        "X-Dataset-Used": "vendas_agregado_uf",
-    }
+    assert list(csv_lines(result)) == [
+        "sigla_uf\r\n",
+        "SP\r\n",
+        "RJ\r\n",
+        "MG\r\n",
+    ]

@@ -37,7 +37,7 @@ GET http://localhost:8000/v1/query
 # Saída em CSV (seção 2.3a) — parâmetro explícito, para link de download
 GET http://localhost:8000/v1/query
 ?schema=vendas
-&dimensions=sigla_uf
+&dimensions=sigla_uf,cargo
 #&measures=valor_total
 &format=csv
 
@@ -65,3 +65,11 @@ accept: text/csv
     "dimensions": ["filial"],
     "measures": ["quantidade_disponivel"]
 }
+
+###
+# Consulta pesada (seção 2.4a) — 202, depois o corpo traz `download_url`
+GET http://localhost:8000/v1/query/q_9d31be
+
+###
+# Baixa o CSV que o worker gravou
+GET http://localhost:8000/v1/query/q_9d31be/download

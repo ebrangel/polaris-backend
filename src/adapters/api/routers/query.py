@@ -13,22 +13,25 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
 from adapters.api.content_negotiation import CSV_MEDIA_TYPE, OutputFormat
-from adapters.api.csv_presenter import csv_headers, csv_lines
+from adapters.api.csv_presenter import csv_filename, csv_headers, csv_lines
 from adapters.api.dependencies import (
     CatalogDep,
     ClientIdDep,
     ExecuteQueryDep,
     JobQueueDep,
     OutputFormatDep,
+    ResultExporterDep,
     RolesDep,
 )
 from adapters.api.errors import (
+    EXPORT_NOT_FOUND_TYPE,
     MALFORMED_REQUEST_TYPE,
     UNKNOWN_QUERY_TYPE,
     problem_response,
 )
 from adapters.api.query_params import parse_flat_params, schema_name_from_params
 from adapters.api.schemas import QueryRequestModel, present_result
+from application.ports.result_exporter import ExportMetadata, ResultExporter
 from domain.models import QueryRequest, QueryResult, QueryStatus
 
 router = APIRouter(prefix="/v1/query", tags=["query"])
@@ -69,20 +72,81 @@ def _model_from_json(raw: str) -> QueryRequestModel | JSONResponse:
         )
 
 
-def _completed_response(result: QueryResult, output_format: OutputFormat) -> Response:
+def _export_not_found(query_id: str) -> JSONResponse:
+    return problem_response(
+        type_=EXPORT_NOT_FOUND_TYPE,
+        title="Export não disponível",
+        status=404,
+        detail=(
+            f"Não há arquivo para download da consulta '{query_id}' — ela não passou "
+            "pela fila, o arquivo expirou, ou o servidor não tem export configurado."
+        ),
+        fields=[query_id],
+    )
+
+
+async def _file_response(
+    exporter: ResultExporter,
+    export: ExportMetadata,
+    *,
+    headers: dict[str, str] | None = None,
+) -> Response:
+    """Serve o arquivo que o worker gravou (seção 2.4a), em blocos.
+
+    É o caminho que evita materializar o resultado no processo da API: os bytes vão do
+    disco para o socket sem passar por um `QueryResult` em memória.
+    """
+    try:
+        stream = await exporter.open(export.query_id)
+    except FileNotFoundError:
+        # Corrida contra a varredura de expirados, entre o `stat()` e o `open()`.
+        return _export_not_found(export.query_id)
+
+    return StreamingResponse(
+        stream,
+        status_code=200,
+        media_type=CSV_MEDIA_TYPE,
+        headers={
+            "Content-Disposition": f'attachment; filename="{csv_filename(export.query_id)}"',
+            "X-Query-Id": export.query_id,
+            **(headers or {}),
+            "Content-Length": str(export.size_bytes),
+        },
+    )
+
+
+async def _completed_response(
+    result: QueryResult,
+    output_format: OutputFormat,
+    *,
+    exporter: ResultExporter | None = None,
+    export: ExportMetadata | None = None,
+) -> Response:
     """Corpo da seção 2.3 no formato negociado (seção 2.3a) — o **único** ponto do
-    caminho da consulta em que o formato de saída importa."""
-    if output_format is OutputFormat.CSV:
-        return StreamingResponse(
-            csv_lines(result),
-            status_code=200,
-            media_type=CSV_MEDIA_TYPE,
-            headers=csv_headers(result),
+    caminho da consulta em que o formato de saída importa.
+
+    Havendo arquivo gravado pelo worker, o CSV sai dele em vez de ser renderizado de
+    novo: mesmos bytes, sem o custo de reserializar, e o caminho vale para resultado de
+    qualquer tamanho. Sem arquivo — toda consulta síncrona, que nunca passou pela fila —
+    renderiza do resultado em memória, como antes.
+    """
+    if output_format is not OutputFormat.CSV:
+        return JSONResponse(
+            status_code=200, content=present_result(result, export=export)
         )
-    return JSONResponse(status_code=200, content=present_result(result))
+
+    if exporter is not None and export is not None:
+        return await _file_response(exporter, export, headers=csv_headers(result))
+
+    return StreamingResponse(
+        csv_lines(result),
+        status_code=200,
+        media_type=CSV_MEDIA_TYPE,
+        headers=csv_headers(result),
+    )
 
 
-def _response_for(result: QueryResult, output_format: OutputFormat) -> Response:
+async def _response_for(result: QueryResult, output_format: OutputFormat) -> Response:
     """202 para consulta enfileirada (seção 2.4); 200 para resultado pronto (2.3).
 
     A resposta de enfileiramento (e a de falha) sai **sempre em JSON**, qualquer que
@@ -90,12 +154,16 @@ def _response_for(result: QueryResult, output_format: OutputFormat) -> Response:
     representação em CSV. Recusar CSV para consulta pesada seria pior — export grande é
     justamente o caso de uso do formato; o cliente enfileira, acompanha o status em
     JSON e baixa o CSV em `GET /v1/query/{query_id}?format=csv`.
+
+    Não consulta o exportador: um resultado que chega por aqui foi executado agora ou
+    veio do cache, nunca do worker — export existe só para consulta que passou pela
+    fila, e é em `GET /v1/query/{query_id}` que ele aparece.
     """
     if result.status is QueryStatus.PROCESSING:
         return JSONResponse(status_code=202, content=present_result(result))
     if result.status is QueryStatus.FAILED:
         return JSONResponse(status_code=200, content=present_result(result))
-    return _completed_response(result, output_format)
+    return await _completed_response(result, output_format)
 
 
 async def _run(
@@ -106,7 +174,7 @@ async def _run(
     output_format: OutputFormat,
 ) -> Response:
     result = await execute_query(domain_request, roles=roles, client_id=client_id)
-    return _response_for(result, output_format)
+    return await _response_for(result, output_format)
 
 
 @router.post("")
@@ -155,9 +223,29 @@ async def get_query(
     return await _run(model.to_domain(), execute_query, roles, client_id, output_format)
 
 
+@router.get("/{query_id}/download")
+async def download_query_export(
+    query_id: str, result_exporter: ResultExporterDep
+) -> Response:
+    """Baixa o CSV que o worker gravou para uma consulta pesada (seção 2.4a).
+
+    Não toca na fila nem no cache: o arquivo é a fonte, e ele sobrevive ao TTL da
+    entrada do job no Redis. Por isso os headers de `meta` (`X-Dataset-Used`,
+    `X-Execution-Ms`) não aparecem aqui — quem quiser esses números pede
+    `GET /v1/query/{query_id}`, enquanto o job existir.
+    """
+    export = None if result_exporter is None else await result_exporter.stat(query_id)
+    if result_exporter is None or export is None:
+        return _export_not_found(query_id)
+    return await _file_response(result_exporter, export)
+
+
 @router.get("/{query_id}")
 async def get_query_status(
-    query_id: str, job_queue: JobQueueDep, output_format: OutputFormatDep
+    query_id: str,
+    job_queue: JobQueueDep,
+    output_format: OutputFormatDep,
+    result_exporter: ResultExporterDep,
 ) -> Response:
     """Status/resultado de uma consulta assíncrona (seção 2.4).
 
@@ -165,8 +253,8 @@ async def get_query_status(
     leitura de status é que teve sucesso. O 202 é da submissão, não da consulta de
     status.
 
-    Com `?format=csv` este é o passo de download do fluxo assíncrono: o cliente
-    acompanha o status em JSON e, quando `completed`, baixa o resultado como arquivo.
+    Concluída, a resposta JSON ganha `download_url`/`download_expires_at` quando o
+    worker deixou um arquivo para trás; com `?format=csv`, o próprio arquivo é servido.
     """
     result = await job_queue.get_status(query_id)
     if result is None:
@@ -177,6 +265,10 @@ async def get_query_status(
             detail=f"Nenhuma consulta com o identificador '{query_id}'.",
             fields=[query_id],
         )
-    if result.status is QueryStatus.COMPLETED:
-        return _completed_response(result, output_format)
-    return JSONResponse(status_code=200, content=present_result(result))
+    if result.status is not QueryStatus.COMPLETED:
+        return JSONResponse(status_code=200, content=present_result(result))
+
+    export = None if result_exporter is None else await result_exporter.stat(query_id)
+    return await _completed_response(
+        result, output_format, exporter=result_exporter, export=export
+    )

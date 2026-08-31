@@ -58,6 +58,11 @@ HTTP_ERROR_TYPE = "http_error"
 #: `type` que a lista da seção 2.5 não previa.
 INVALID_FORMAT_TYPE = "invalid_format"
 
+#: Download de um export que não existe, expirou, ou nunca foi gerado porque o servidor
+#: não tem exportador configurado (seção 2.4a). Os três casos respondem igual de
+#: propósito: para o cliente, "não há arquivo para baixar" é uma informação só.
+EXPORT_NOT_FOUND_TYPE = "export_not_found"
+
 
 def status_for(error: DomainError) -> int:
     return _STATUS_BY_ERROR.get(type(error), 500)

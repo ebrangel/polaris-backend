@@ -54,6 +54,8 @@ Com o catálogo de exemplo completo, isso significa `DW_VENDAS_PG_URL`, `DW_VEND
 | `HEAVY_QUERY_RATE_LIMIT` | `5` | Consultas pesadas por cliente, por janela |
 | `HEAVY_QUERY_RATE_LIMIT_WINDOW_SECONDS` | `60` | Tamanho da janela do limite pesado |
 | `MAX_HEAVY_QUEUE_DEPTH` | `100` | Profundidade da fila que dispara backpressure (`429`) |
+| `EXPORT_DIR` | `exports` | Onde o worker grava os CSV de consultas pesadas e de onde a API os serve |
+| `EXPORT_TTL_SECONDS` | `86400` | Validade de cada arquivo exportado (24 h) |
 
 ## Os dois processos
 
@@ -81,6 +83,19 @@ PROCESS_ROLE=worker arq main.WorkerSettings
 
 Consome a fila de consultas pesadas, executa no **pool pesado** do datasource correspondente e grava
 o resultado sob o `query_id`. Escala independentemente da API — se a fila cresce, suba mais workers.
+
+Além disso, para cada job concluído ele **grava um CSV em `EXPORT_DIR`** (seção 2.4a do contrato), que
+a API entrega em `GET /v1/query/{query_id}/download`. Um cron interno do próprio worker varre os
+arquivos vencidos de hora em hora e no boot.
+
+> **`EXPORT_DIR` precisa ser o mesmo caminho para a API e para o worker** — mesmo host, ou um volume
+> compartilhado. É a limitação do adapter de filesystem: num deploy multi-nó sem volume comum, a API
+> não acha o arquivo que outro nó escreveu, e o cliente recebe `404 export_not_found` para um export
+> que existe. Trocar por um adapter de S3 fecha esse buraco sem mudar nada no contrato HTTP — a URL
+> de download continua sendo a da própria API.
+
+A varredura roda no worker, e não na API, de propósito: quem escreve os arquivos é quem os limpa, e
+assim várias réplicas de API não disputam a mesma varredura.
 
 ## Publicação do catálogo
 
@@ -186,6 +201,8 @@ sem que o cliente precise declarar nada.
 | `depth` crescendo | `/internal/observability` | Workers insuficientes — `429` quando bater `MAX_HEAVY_QUEUE_DEPTH` |
 | `consulta lenta` frequente | Logs | Dataset mal escolhido, ou falta de dataset agregado no catálogo |
 | `429 rate_limited` | Logs de acesso | Limite por cliente ou backpressure de fila |
+| `404 export_not_found` em consulta concluída | Logs de acesso | `EXPORT_DIR` diferente entre API e worker, ou arquivo já vencido |
+| `falha ao exportar o resultado` | Logs do worker | Disco cheio ou `EXPORT_DIR` sem permissão de escrita — o job conclui, só não deixa arquivo |
 
 ## Rate limiting
 

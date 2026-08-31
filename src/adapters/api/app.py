@@ -25,6 +25,7 @@ from adapters.api.routers import observability as observability_router
 from adapters.api.routers import query as query_router
 from application.ports.catalog_repository import CatalogRepository
 from application.ports.job_queue import JobQueue
+from application.ports.result_exporter import ResultExporter
 from application.use_cases.execute_query import ExecuteQuery
 from application.use_cases.get_observability_snapshot import GetObservabilitySnapshot
 from application.use_cases.publish_catalog import PublishCatalog
@@ -37,6 +38,7 @@ def create_app(
     catalog: Catalog | None = None,
     execute_query: ExecuteQuery | None = None,
     job_queue: JobQueue | None = None,
+    result_exporter: ResultExporter | None = None,
     publish_catalog: PublishCatalog | None = None,
     catalog_repository: CatalogRepository | None = None,
     get_observability_snapshot: GetObservabilitySnapshot | None = None,
@@ -83,6 +85,9 @@ def create_app(
     app.state.catalog = catalog
     app.state.execute_query = execute_query
     app.state.job_queue = job_queue
+    # Sem exportador, `/v1/query/{id}/download` responde 404 e `download_url` não
+    # aparece — não é uma rota condicional como as de `/internal/*` (seção 2.4a).
+    app.state.result_exporter = result_exporter
     app.state.publish_catalog = publish_catalog
     app.state.catalog_repository = catalog_repository
     app.state.get_observability_snapshot = get_observability_snapshot

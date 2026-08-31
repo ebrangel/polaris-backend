@@ -15,6 +15,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from adapters.serialization import jsonable
+from application.ports.result_exporter import ExportMetadata
 from domain.models import (
     Filter,
     FilterOperator,
@@ -85,8 +86,21 @@ def poll_url_for(query_id: str) -> str:
     return f"/v1/query/{query_id}"
 
 
-def present_result(result: QueryResult) -> dict[str, Any]:
-    """`QueryResult` → corpo da seção 2.3 (concluído/falho) ou 2.4 (em processamento)."""
+def download_url_for(query_id: str) -> str:
+    return f"/v1/query/{query_id}/download"
+
+
+def present_result(
+    result: QueryResult, *, export: ExportMetadata | None = None
+) -> dict[str, Any]:
+    """`QueryResult` → corpo da seção 2.3 (concluído/falho) ou 2.4 (em processamento).
+
+    `export` é o arquivo que o worker gravou para esta consulta, quando existe (seção
+    2.4a): dele saem `download_url` e `download_expires_at`. Como o `poll_url`, os dois
+    são **detalhe de transporte** montados aqui — o `QueryResult` do domínio não os
+    carrega, e uma consulta síncrona (que nunca passou pelo worker) simplesmente não
+    tem export, então as chaves não aparecem.
+    """
     if result.status is QueryStatus.PROCESSING:
         return {
             "query_id": result.query_id,
@@ -109,7 +123,7 @@ def present_result(result: QueryResult) -> dict[str, Any]:
         columns.append(item)
 
     assert result.meta is not None  # garantido pelas invariantes de QueryResult
-    return {
+    body: dict[str, Any] = {
         "query_id": result.query_id,
         "status": result.status.value,
         "columns": columns,
@@ -125,6 +139,10 @@ def present_result(result: QueryResult) -> dict[str, Any]:
             "dataset_used": result.meta.dataset_used,
         },
     }
+    if export is not None:
+        body["download_url"] = download_url_for(result.query_id)
+        body["download_expires_at"] = export.expires_at.isoformat()
+    return body
 
 
 def present_schema_summary(schema: Schema) -> dict[str, Any]:

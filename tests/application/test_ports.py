@@ -19,6 +19,7 @@ from application.ports.datasource_inspector import DatasourceInspector
 from application.ports.job_queue import JobQueue
 from application.ports.query_executor import ExecutionProfile, QueryCost, QueryExecutor
 from application.ports.rate_limiter import RateLimiter
+from application.ports.result_exporter import ResultExporter
 from domain.errors import QueryTimeoutError
 from domain.models import QueryRequest, QueryResult
 from fakes import (
@@ -27,6 +28,7 @@ from fakes import (
     InMemoryCatalogRepository,
     InMemoryJobQueue,
     InMemoryRateLimiter,
+    InMemoryResultExporter,
     StubDatasourceInspector,
     StubQueryExecutor,
 )
@@ -45,6 +47,10 @@ PORT_METHODS = {
     DatasourceInspector: (StubDatasourceInspector, ("missing_fields",)),
     CatalogInvalidator: (InMemoryCatalogInvalidator, ("publish",)),
     RateLimiter: (InMemoryRateLimiter, ("allow",)),
+    ResultExporter: (
+        InMemoryResultExporter,
+        ("export", "stat", "open", "purge_expired"),
+    ),
 }
 
 

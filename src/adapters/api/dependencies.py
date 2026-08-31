@@ -13,6 +13,7 @@ from fastapi import Depends, Header, HTTPException, Query, Request
 from adapters.api.content_negotiation import OutputFormat, resolve_output_format
 from application.ports.catalog_repository import CatalogRepository
 from application.ports.job_queue import JobQueue
+from application.ports.result_exporter import ResultExporter
 from application.use_cases.execute_query import ExecuteQuery
 from application.use_cases.get_observability_snapshot import GetObservabilitySnapshot
 from application.use_cases.publish_catalog import PublishCatalog
@@ -29,6 +30,18 @@ def get_execute_query(request: Request) -> ExecuteQuery:
 
 def get_job_queue(request: Request) -> JobQueue:
     return request.app.state.job_queue
+
+
+def get_result_exporter(request: Request) -> ResultExporter | None:
+    """Exportador de resultados pesados (seção 2.4a) — **pode ser `None`**.
+
+    Diferente das demais peças, esta é lida como opcional dentro do próprio router: sem
+    exportador configurado não existe export nenhum, então `download_url` some do corpo
+    e a rota de download responde `404 export_not_found`, que é a mesma resposta de um
+    export que expirou. Um `501` só distinguiria "não configurado" de "não existe" para
+    quem opera o servidor, e a informação já está no boot.
+    """
+    return getattr(request.app.state, "result_exporter", None)
 
 
 def get_publish_catalog(request: Request) -> PublishCatalog:
@@ -113,6 +126,7 @@ JobQueueDep = Annotated[JobQueue, Depends(get_job_queue)]
 RolesDep = Annotated[tuple[str, ...], Depends(get_roles)]
 ClientIdDep = Annotated[str, Depends(get_client_id)]
 OutputFormatDep = Annotated[OutputFormat, Depends(get_output_format)]
+ResultExporterDep = Annotated[ResultExporter | None, Depends(get_result_exporter)]
 PublishCatalogDep = Annotated[PublishCatalog, Depends(get_publish_catalog)]
 CatalogRepositoryDep = Annotated[CatalogRepository, Depends(get_catalog_repository)]
 ObservabilitySnapshotDep = Annotated[

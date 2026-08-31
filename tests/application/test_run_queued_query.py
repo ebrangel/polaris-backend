@@ -10,7 +10,7 @@ from fixtures import catalog, vendas_schema
 from application.ports.query_executor import ExecutionProfile
 from application.use_cases.run_queued_query import RunQueuedQuery
 from domain.models import Catalog, QueryRequest, QueryResult, QueryStatus
-from fakes import StubQueryExecutor
+from fakes import InMemoryResultExporter, StubQueryExecutor
 
 
 async def test_executa_no_perfil_heavy():
@@ -114,3 +114,55 @@ async def test_sem_threshold_configurado_nunca_loga(caplog):
         await run(request, dataset_name="vendas_agregado_uf")
 
     assert caplog.records == []
+
+
+# --- Export do resultado (seção 2.4a) ---------------------------------------------------
+
+
+async def test_exporta_o_resultado_apos_executar():
+    """Todo job pesado concluído deixa um arquivo baixável — não só os que pediram CSV.
+    O formato de saída não faz parte da `QueryRequest` (seção 2.3a), e o `arq` deduplica
+    jobs por `query_id`: condicionar o export à intenção do cliente perderia a intenção
+    da segunda de duas requisições idênticas."""
+    exporter = InMemoryResultExporter()
+    run = RunQueuedQuery(
+        catalog=catalog(),
+        executors={"env:DW_VENDAS_PG_URL": StubQueryExecutor()},
+        result_exporter=exporter,
+    )
+    request = QueryRequest(schema="vendas", dimensions=("sigla_uf",), measures=("valor_total",))
+
+    result = await run(request, dataset_name="vendas_agregado_uf")
+
+    assert exporter.calls == [result.query_id]
+    assert await exporter.stat(result.query_id) is not None
+
+
+async def test_sem_exportador_configurado_nao_exporta():
+    """Comportamento anterior ao export, preservado: a consulta roda e volta pela fila."""
+    run = RunQueuedQuery(
+        catalog=catalog(), executors={"env:DW_VENDAS_PG_URL": StubQueryExecutor()}
+    )
+    request = QueryRequest(schema="vendas", dimensions=("sigla_uf",), measures=("valor_total",))
+
+    result = await run(request, dataset_name="vendas_agregado_uf")
+
+    assert result.status is QueryStatus.COMPLETED
+
+
+async def test_falha_de_export_nao_derruba_o_job(caplog):
+    """O resultado já foi calculado — o cliente perde o link de download, não a
+    resposta."""
+    exporter = InMemoryResultExporter(raises=OSError("disco cheio"))
+    run = RunQueuedQuery(
+        catalog=catalog(),
+        executors={"env:DW_VENDAS_PG_URL": StubQueryExecutor()},
+        result_exporter=exporter,
+    )
+    request = QueryRequest(schema="vendas", dimensions=("sigla_uf",), measures=("valor_total",))
+
+    with caplog.at_level(logging.WARNING):
+        result = await run(request, dataset_name="vendas_agregado_uf")
+
+    assert result.status is QueryStatus.COMPLETED
+    assert "falha ao exportar" in caplog.text
