@@ -106,6 +106,7 @@ def select_dataset(schema, requested_dimensions, requested_measures, filter_fiel
 - Cada dataset tem seu próprio `mapping` de nomes lógicos → colunas físicas, porque a mesma dimensão lógica (`sigla_uf`) pode ter nomes de coluna diferentes em cada fonte.
 - Se nenhum dataset cobrir a requisição, a API responde com erro `no_dataset_available` (seção 2.5) — nunca tenta "montar" a resposta combinando datasets.
 - `access_control` fica no nível do schema (modelo lógico), não por dataset — a permissão é sobre o dado que o cliente pode ver, não sobre onde ele está fisicamente armazenado.
+- `max_limit` (opcional, nível do schema) é o teto de linhas da seção 2.6, aplicado **inclusive à requisição que não manda `limit` nenhum**. Sem ele o SQL sai sem `LIMIT` e o resultado inteiro é materializado em memória no processo que executa; por isso todo schema não declarado herda o teto de operação `DEFAULT_MAX_LIMIT` (`docs/operacao.md`), e o valor declarado no catálogo sempre tem precedência sobre ele.
 
 ### 1.1 Elasticsearch como dataset (sem joins)
 

@@ -1,6 +1,13 @@
 version: 1
 schema: eventos_navegacao
 
+# Teto mais baixo que o dos schemas relacionais, de propósito: aqui cada linha é um
+# bucket de uma agregação `composite`, e o adapter já usava 1000 como `size` padrão para
+# requisição sem `limit` (`adapters/executors/elasticsearch_dsl.py`). Igualar o teto a
+# esse padrão mantém o comportamento de quem não manda `limit` e passa a valer também
+# para quem manda um valor alto.
+max_limit: 1000
+
 dimensions:
   pais:
     type: string

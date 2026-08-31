@@ -883,13 +883,23 @@ class Schema:
                 forbidden,
             )
 
-    def effective_limit(self, requested: int | None) -> int | None:
-        """Aplica o `limit` máximo configurado para o schema (seção 2.6)."""
-        if self.max_limit is None:
+    def effective_limit(
+        self, requested: int | None, default_max_limit: int | None = None
+    ) -> int | None:
+        """Aplica o `limit` máximo configurado para o schema (seção 2.6).
+
+        `default_max_limit` é a rede de segurança de quem chama (o valor de operação,
+        vindo de `Settings`): vale **só** quando o schema não declara `max_limit`, para
+        que um schema novo não nasça sem teto nenhum — e um schema que declara o seu
+        continue mandando, para mais ou para menos. Quem passa o parâmetro é o use case
+        `ExecuteQuery`; o domínio não lê configuração, só recebe o número.
+        """
+        ceiling = self.max_limit if self.max_limit is not None else default_max_limit
+        if ceiling is None:
             return requested
         if requested is None:
-            return self.max_limit
-        return min(requested, self.max_limit)
+            return ceiling
+        return min(requested, ceiling)
 
     def columns_for(self, request: QueryRequest) -> tuple[Column, ...]:
         """Colunas da resposta, na ordem pedida — medidas são sempre `number` (seção 2.3)."""

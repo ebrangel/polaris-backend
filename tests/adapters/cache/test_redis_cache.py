@@ -4,6 +4,7 @@ desde o Marco 2.
 """
 
 import asyncio
+import logging
 import shutil
 import subprocess
 
@@ -92,6 +93,58 @@ async def test_recusa_resultado_nao_concluido(redis_client):
         await cache.set("q_proc", QueryResult.processing("q_proc"))
 
     assert await cache.get("q_proc") is None
+
+
+def _resultado_com_linhas(query_id: str, row_count: int) -> QueryResult:
+    return QueryResult.completed(
+        query_id=query_id,
+        columns=(
+            Column(field="sigla_uf", type=DataType.STRING),
+            Column(field="valor_total", type=DataType.NUMBER),
+        ),
+        rows=tuple((f"UF{i}", float(i)) for i in range(row_count)),
+        dataset_used="vendas_agregado_uf",
+        execution_ms=1,
+    )
+
+
+async def test_resultado_acima_do_teto_de_linhas_nao_e_cacheado(redis_client, caplog):
+    """Guardar um resultado gigante custa a memória do Redis e expulsa as consultas
+    pequenas — que são as que se repetem. Não cachear não é erro: a próxima requisição
+    igual simplesmente executa de novo."""
+    cache = RedisCacheGateway(redis_client, key_prefix="test_max_rows:", max_rows=10)
+
+    with caplog.at_level(logging.INFO):
+        await cache.set("q_grande", _resultado_com_linhas("q_grande", 11))
+
+    assert await redis_client.get("test_max_rows:q_grande") is None
+    assert "não cacheado" in caplog.text
+    # No teto ainda cabe — o corte é acima dele, não a partir dele.
+    await cache.set("q_no_teto", _resultado_com_linhas("q_no_teto", 10))
+    assert await cache.get("q_no_teto") is not None
+
+
+async def test_payload_acima_do_teto_de_bytes_nao_e_cacheado(redis_client):
+    """O segundo teto pega o que o de linhas não pega: poucas linhas muito largas — e é
+    ele que corresponde ao limite de tamanho de valor do próprio Redis."""
+    cache = RedisCacheGateway(
+        redis_client, key_prefix="test_max_bytes:", max_rows=None, max_payload_bytes=200
+    )
+
+    await cache.set("q_largo", _resultado_com_linhas("q_largo", 50))
+
+    assert await redis_client.get("test_max_bytes:q_largo") is None
+
+
+async def test_tetos_desligados_gravam_qualquer_resultado(redis_client):
+    cache = RedisCacheGateway(
+        redis_client, key_prefix="test_sem_teto:", max_rows=None, max_payload_bytes=None
+    )
+    result = _resultado_com_linhas("q_sem_teto", 500)
+
+    await cache.set("q_sem_teto", result)
+
+    assert await cache.get("q_sem_teto") == result
 
 
 async def test_ttl_expira_de_verdade(redis_client):

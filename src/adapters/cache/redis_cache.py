@@ -5,6 +5,7 @@ colidir com o namespace `arq:*` que a fila (`ArqJobQueue`) usa no mesmo Redis.
 """
 
 import json
+import logging
 
 from redis.asyncio import Redis
 
@@ -17,16 +18,38 @@ from domain.models import QueryResult, QueryStatus
 _HITS_KEY = "cache:hits"
 _MISSES_KEY = "cache:misses"
 
+logger = logging.getLogger(__name__)
+
 
 class RedisCacheGateway:
     """Cache de `QueryResult` por `query_id`, com TTL padrão configurável."""
 
     def __init__(
-        self, client: Redis, key_prefix: str = "query:", default_ttl_seconds: int | None = 3600
+        self,
+        client: Redis,
+        key_prefix: str = "query:",
+        default_ttl_seconds: int | None = 3600,
+        max_rows: int | None = 100_000,
+        max_payload_bytes: int | None = 8 * 1024 * 1024,
     ) -> None:
+        """`max_rows`/`max_payload_bytes` são o teto do que vale a pena cachear.
+
+        Não é uma decisão de negócio (por isso mora aqui, e não no use case): é a
+        realidade do Redis, que guarda cada valor inteiro em memória e recusa valores
+        acima do seu próprio limite. Um resultado gigante gravado a cada consulta
+        expulsaria do cache todas as consultas pequenas — que são justamente as que se
+        repetem e as que o cache existe para acelerar.
+
+        Os dois tetos são checados em momentos diferentes de propósito: `max_rows`
+        **antes** de serializar (é o que evita montar um JSON de centenas de MB só para
+        descobrir que ele não cabe) e `max_payload_bytes` depois, sobre o tamanho real.
+        `None` em qualquer um deles desliga aquele teto.
+        """
         self._client = client
         self._key_prefix = key_prefix
         self._default_ttl_seconds = default_ttl_seconds
+        self._max_rows = max_rows
+        self._max_payload_bytes = max_payload_bytes
 
     def _redis_key(self, key: str) -> str:
         return f"{self._key_prefix}{key}"
@@ -40,11 +63,34 @@ class RedisCacheGateway:
         return dict_to_result(json.loads(raw))
 
     async def set(self, key: str, result: QueryResult, ttl_seconds: int | None = None) -> None:
+        """Resultado acima dos tetos não é cacheado — e isso **não** é erro.
+
+        O port promete gravar o que couber; um resultado grande demais é ignorado com
+        log, e a consulta seguinte simplesmente executa de novo. Levantar exceção aqui
+        transformaria um limite de operação em falha de requisição.
+        """
         if result.status is not QueryStatus.COMPLETED:
             raise ValueError("só resultados com status=completed são cacheáveis")
 
-        ttl = ttl_seconds if ttl_seconds is not None else self._default_ttl_seconds
+        if self._max_rows is not None and len(result.rows) > self._max_rows:
+            logger.info(
+                "resultado de %s não cacheado: %d linhas acima do teto de %d",
+                key, len(result.rows), self._max_rows,
+            )
+            return
+
         payload = json.dumps(result_to_dict(result))
+        # `json.dumps` escapa não-ASCII por padrão, então o payload é ASCII puro e
+        # `len()` (caracteres) é exatamente o tamanho em bytes — sem pagar uma cópia
+        # extra do texto inteiro só para medi-lo com `encode()`.
+        if self._max_payload_bytes is not None and len(payload) > self._max_payload_bytes:
+            logger.info(
+                "resultado de %s não cacheado: %d bytes acima do teto de %d",
+                key, len(payload), self._max_payload_bytes,
+            )
+            return
+
+        ttl = ttl_seconds if ttl_seconds is not None else self._default_ttl_seconds
         await self._client.set(self._redis_key(key), payload, ex=ttl)
 
     async def delete(self, key: str) -> None:

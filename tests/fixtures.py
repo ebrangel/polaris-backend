@@ -112,6 +112,7 @@ def vendas_schema() -> Schema:
             "quantidade": Measure(name="quantidade", agg=Aggregation.SUM),
         },
         access_control=AccessControl(roles={"financeiro": {"valor_total", "quantidade"}}),
+        max_limit=50_000,
         datasets=(vendas_agregado_uf(), vendas_detalhado()),
     )
 
@@ -132,6 +133,7 @@ def vendas_schema_com_canal() -> Schema:
         },
         measures=base.measures,
         access_control=base.access_control,
+        max_limit=base.max_limit,
         datasets=base.datasets,
     )
 
@@ -177,6 +179,7 @@ def eventos_schema() -> Schema:
             "duracao_media": Measure(name="duracao_media", agg=Aggregation.AVG),
             "total_eventos": Measure(name="total_eventos", agg=Aggregation.VALUE_COUNT),
         },
+        max_limit=1_000,
         datasets=(eventos_navegacao_es(),),
     )
 
@@ -222,6 +225,7 @@ def estoque_schema() -> Schema:
             ),
             "valor_unitario": Measure(name="valor_unitario", agg=Aggregation.AVG),
         },
+        max_limit=50_000,
         datasets=(estoque_atual_pg(),),
     )
 

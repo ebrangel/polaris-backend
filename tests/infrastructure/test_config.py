@@ -68,7 +68,11 @@ def test_load_settings_le_os_opcionais_quando_presentes(env_obrigatorio, monkeyp
     monkeypatch.setenv("LIGHT_TIMEOUT_SECONDS", "2.5")
     monkeypatch.setenv("HEAVY_TIMEOUT_SECONDS", "600")
     monkeypatch.setenv("COST_THRESHOLD", "5000")
+    monkeypatch.setenv("HEURISTIC_COST_THRESHOLD", "15")
     monkeypatch.setenv("CACHE_TTL_SECONDS", "60")
+    monkeypatch.setenv("CACHE_MAX_ROWS", "5000")
+    monkeypatch.setenv("CACHE_MAX_PAYLOAD_BYTES", "1048576")
+    monkeypatch.setenv("DEFAULT_MAX_LIMIT", "20000")
     monkeypatch.setenv("LIGHT_POOL_SIZE", "10")
     monkeypatch.setenv("HEAVY_POOL_SIZE", "2")
     monkeypatch.setenv("SLOW_QUERY_THRESHOLD_MS", "500")
@@ -85,7 +89,11 @@ def test_load_settings_le_os_opcionais_quando_presentes(env_obrigatorio, monkeyp
     assert settings.light_timeout_seconds == 2.5
     assert settings.heavy_timeout_seconds == 600.0
     assert settings.cost_threshold == 5000.0
+    assert settings.heuristic_cost_threshold == 15.0
     assert settings.cache_ttl_seconds == 60
+    assert settings.cache_max_rows == 5000
+    assert settings.cache_max_payload_bytes == 1_048_576
+    assert settings.default_max_limit == 20_000
     assert settings.light_pool_size == 10
     assert settings.heavy_pool_size == 2
     assert settings.slow_query_threshold_ms == 500
@@ -103,7 +111,11 @@ def test_load_settings_usa_defaults_dos_opcionais_ausentes(env_obrigatorio):
     assert settings.light_timeout_seconds == 5.0
     assert settings.heavy_timeout_seconds == 300.0
     assert settings.cost_threshold == 10_000.0
+    assert settings.heuristic_cost_threshold == 30.0
     assert settings.cache_ttl_seconds == 3600
+    assert settings.cache_max_rows == 100_000
+    assert settings.cache_max_payload_bytes == 8 * 1024 * 1024
+    assert settings.default_max_limit == 50_000
     assert settings.light_pool_size == 20
     assert settings.heavy_pool_size == 3
     assert settings.slow_query_threshold_ms == 2000

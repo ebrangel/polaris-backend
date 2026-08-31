@@ -41,6 +41,7 @@ def make_execute_query(
     heavy_query_rate_limiter=None,
     max_heavy_queue_depth=None,
     slow_query_threshold_ms=None,
+    default_max_limit=None,
 ):
     return ExecuteQuery(
         catalog=cat,
@@ -52,7 +53,20 @@ def make_execute_query(
         heavy_query_rate_limiter=heavy_query_rate_limiter,
         max_heavy_queue_depth=max_heavy_queue_depth,
         slow_query_threshold_ms=slow_query_threshold_ms,
+        default_max_limit=default_max_limit,
     )
+
+
+def como_executada(request: QueryRequest, schema=None) -> QueryRequest:
+    """A requisição como o use case a executa: com o teto de `limit` do schema aplicado.
+
+    O teto entra **antes** do `query_id` (seção 2.6), então é esta — e não a que o
+    cliente montou — que dá a chave de cache, o `query_id` da resposta e o payload do
+    job. Os schemas do catálogo declaram `max_limit`, logo até requisição sem `limit`
+    passa por aqui.
+    """
+    schema = schema if schema is not None else vendas_schema()
+    return dataclasses.replace(request, limit=schema.effective_limit(request.limit))
 
 
 # --- Caminho feliz -----------------------------------------------------------------------
@@ -115,7 +129,7 @@ async def test_cache_miss_grava_e_cache_hit_nao_executa_de_novo():
     first = await execute(request, roles=["financeiro"], client_id="cliente-1")
     assert len(stub.calls) == 1
     assert first.meta.cached is False
-    assert await cache.get(request.query_id) == first
+    assert await cache.get(como_executada(request).query_id) == first
 
     second = await execute(request, roles=["financeiro"], client_id="cliente-1")
 
@@ -214,11 +228,12 @@ async def test_consulta_pesada_enfileira_sem_executar_nem_cachear():
 
     result = await execute(request, roles=["financeiro"], client_id="cliente-1")
 
+    executada = como_executada(request)
     assert result.status is QueryStatus.PROCESSING
-    assert result.query_id == request.query_id
+    assert result.query_id == executada.query_id
     assert stub.calls == []  # `execute()` nunca foi chamado
-    assert await cache.get(request.query_id) is None  # nada cacheado
-    assert job_queue.calls == [(request, "vendas_agregado_uf")]  # dataset.name correto
+    assert await cache.get(executada.query_id) is None  # nada cacheado
+    assert job_queue.calls == [(executada, "vendas_agregado_uf")]  # dataset.name correto
 
 
 async def test_consulta_leve_nao_enfileira():
@@ -288,6 +303,73 @@ async def test_teto_de_limit_por_schema_e_aplicado_e_compartilha_cache():
 
     assert len(stub.calls) == 1  # mesma entrada de cache, não executou de novo
     assert result.meta.cached is True
+
+
+async def test_teto_padrao_protege_schema_publicado_sem_max_limit():
+    """Sem `max_limit` no catálogo e sem teto de operação, a consulta sem `limit` vira
+    `SELECT` sem `LIMIT` — a tabela inteira materializada em memória. O
+    `default_max_limit` é o que impede isso num schema recém-publicado."""
+    schema = dataclasses.replace(vendas_schema(), max_limit=None)
+    sem_limite = QueryRequest(schema="vendas", dimensions=("sigla_uf",))
+
+    desprotegido = StubQueryExecutor()
+    await make_execute_query(
+        Catalog(schemas={"vendas": schema}),
+        executors={"env:DW_VENDAS_PG_URL": desprotegido},
+    )(sem_limite, roles=[], client_id="cliente-1")
+    assert desprotegido.calls[0][1].limit is None
+
+    protegido = StubQueryExecutor()
+    await make_execute_query(
+        Catalog(schemas={"vendas": schema}),
+        executors={"env:DW_VENDAS_PG_URL": protegido},
+        default_max_limit=50_000,
+    )(sem_limite, roles=[], client_id="cliente-1")
+    assert protegido.calls[0][1].limit == 50_000
+
+
+async def test_teto_do_schema_tem_precedencia_sobre_o_teto_padrao():
+    stub = StubQueryExecutor()
+    execute = make_execute_query(
+        Catalog(schemas={"vendas": dataclasses.replace(vendas_schema(), max_limit=500)}),
+        executors={"env:DW_VENDAS_PG_URL": stub},
+        default_max_limit=50_000,
+    )
+
+    await execute(
+        QueryRequest(schema="vendas", dimensions=("sigla_uf",)),
+        roles=[],
+        client_id="cliente-1",
+    )
+
+    assert stub.calls[0][1].limit == 500
+
+
+# --- Falha de cache não derruba resposta já calculada -----------------------------------
+
+
+async def test_falha_ao_gravar_no_cache_nao_derruba_a_consulta(caplog):
+    """O resultado já foi calculado e o cliente tem direito a ele — cachear é
+    otimização (resultado grande demais para o Redis, Redis fora do ar)."""
+
+    class CacheQueQuebraNoSet(InMemoryCacheGateway):
+        async def set(self, key, result, ttl_seconds=None):
+            raise ConnectionError("Redis indisponível")
+
+    stub = StubQueryExecutor()
+    execute = make_execute_query(
+        Catalog(schemas={"vendas": vendas_schema()}),
+        executors={"env:DW_VENDAS_PG_URL": stub},
+        cache=CacheQueQuebraNoSet(),
+    )
+    request = QueryRequest(schema="vendas", dimensions=("sigla_uf",))
+
+    with caplog.at_level(logging.WARNING):
+        result = await execute(request, roles=[], client_id="cliente-1")
+
+    assert result.status is QueryStatus.COMPLETED
+    assert result.meta.dataset_used == "vendas_agregado_uf"
+    assert "falha ao gravar" in caplog.text
 
 
 # --- Os erros da seção 2.5, todos abortando antes do executor --------------------------

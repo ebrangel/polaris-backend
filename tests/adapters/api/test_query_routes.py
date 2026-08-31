@@ -148,7 +148,9 @@ def test_query_json_tem_precedencia_sobre_os_parametros_planos(client, executor,
     client.get(f"/v1/query?{querystring}", headers=financeiro)
 
     _, domain_request, _, _ = executor.calls[0]
-    assert domain_request.limit is None  # o `limit=7` da querystring foi ignorado
+    # O `limit=7` da querystring foi ignorado; o que chega no executor é o teto do
+    # schema `vendas` (seção 2.6), aplicado a toda requisição que não traz `limit`.
+    assert domain_request.limit == 50_000
     assert domain_request.dimensions == ("sigla_uf",)
 
 

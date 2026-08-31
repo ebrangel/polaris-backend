@@ -1,6 +1,9 @@
 version: 1
 schema: estoque
 
+# Teto de linhas da seção 2.6 — ver o comentário em `vendas.yaml`.
+max_limit: 50000
+
 dimensions:
   filial:
     type: string

@@ -108,6 +108,7 @@ async def build_context(settings: Settings) -> ApplicationContext:
             light_timeout_seconds=settings.light_timeout_seconds,
             heavy_timeout_seconds=settings.heavy_timeout_seconds,
             cost_threshold=settings.cost_threshold,
+            heuristic_threshold=settings.heuristic_cost_threshold,
         )
     for connection_ref, client in es_clients.items():
         executors[connection_ref] = ElasticsearchQueryExecutor(
@@ -162,7 +163,12 @@ def _build_lifespan(
         context = await build_context(settings)
 
         cache_client = Redis.from_url(settings.redis_url, decode_responses=True)
-        cache = RedisCacheGateway(cache_client, default_ttl_seconds=settings.cache_ttl_seconds)
+        cache = RedisCacheGateway(
+            cache_client,
+            default_ttl_seconds=settings.cache_ttl_seconds,
+            max_rows=settings.cache_max_rows,
+            max_payload_bytes=settings.cache_max_payload_bytes,
+        )
 
         job_queue_pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
         job_queue = ArqJobQueue(job_queue_pool)
@@ -200,6 +206,7 @@ def _build_lifespan(
             heavy_query_rate_limiter=heavy_query_rate_limiter,
             max_heavy_queue_depth=settings.max_heavy_queue_depth,
             slow_query_threshold_ms=settings.slow_query_threshold_ms,
+            default_max_limit=settings.default_max_limit,
         )
         app.state.publish_catalog = PublishCatalog(
             repository=context.catalog_repository,

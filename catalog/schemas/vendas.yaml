@@ -2,6 +2,11 @@ version: 1
 schema: vendas
 description: "Vendas — dataset escolhido automaticamente por cobertura de campos"
 
+# Teto de linhas da seção 2.6, aplicado inclusive quando a requisição não manda `limit`
+# nenhum. Sem ele o SQL sai sem `LIMIT` e o resultado inteiro é materializado em memória
+# no processo que executa (várias cópias: driver, tuplas, JSON do cache, corpo HTTP).
+max_limit: 50000
+
 dimensions:
   sigla_uf:
     type: string

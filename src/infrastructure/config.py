@@ -42,7 +42,19 @@ class Settings:
     light_timeout_seconds: float = 5.0
     heavy_timeout_seconds: float = 300.0
     cost_threshold: float = 10_000.0
+    #: Limiar da heurística de custo (contagem de campos), usada quando o dialeto não
+    #: tem `EXPLAIN` coberto ou ele falha. Escala diferente de `cost_threshold` — ver
+    #: `SQLAlchemyQueryExecutor.__init__`.
+    heuristic_cost_threshold: float = 30.0
     cache_ttl_seconds: int = 3600
+    #: Tetos do que vale a pena guardar no Redis: acima deles o resultado não é
+    #: cacheado (a consulta seguinte executa de novo, e nada falha).
+    cache_max_rows: int = 100_000
+    cache_max_payload_bytes: int = 8 * 1024 * 1024
+    #: Teto de linhas para schema que não declara `max_limit` no catálogo — sem ele uma
+    #: consulta sem `limit` vira `SELECT` sem `LIMIT`, e o resultado inteiro é
+    #: materializado em memória.
+    default_max_limit: int = 50_000
     light_pool_size: int = 20
     heavy_pool_size: int = 3
     # --- Export de consultas pesadas (seção 2.4a) -------------------------------------
@@ -71,7 +83,15 @@ def load_settings() -> Settings:
         light_timeout_seconds=float(os.environ.get("LIGHT_TIMEOUT_SECONDS", "5.0")),
         heavy_timeout_seconds=float(os.environ.get("HEAVY_TIMEOUT_SECONDS", "300.0")),
         cost_threshold=float(os.environ.get("COST_THRESHOLD", "10000.0")),
+        heuristic_cost_threshold=float(
+            os.environ.get("HEURISTIC_COST_THRESHOLD", "30.0")
+        ),
         cache_ttl_seconds=int(os.environ.get("CACHE_TTL_SECONDS", "3600")),
+        cache_max_rows=int(os.environ.get("CACHE_MAX_ROWS", "100000")),
+        cache_max_payload_bytes=int(
+            os.environ.get("CACHE_MAX_PAYLOAD_BYTES", str(8 * 1024 * 1024))
+        ),
+        default_max_limit=int(os.environ.get("DEFAULT_MAX_LIMIT", "50000")),
         light_pool_size=int(os.environ.get("LIGHT_POOL_SIZE", "20")),
         heavy_pool_size=int(os.environ.get("HEAVY_POOL_SIZE", "3")),
         export_dir=os.environ.get("EXPORT_DIR", "exports"),

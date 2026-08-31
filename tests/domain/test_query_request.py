@@ -1,5 +1,7 @@
 """`QueryRequest` — o objeto para onde POST e GET convergem (seções 2.2 e 2.2a)."""
 
+import dataclasses
+
 import pytest
 from fixtures import vendas_schema
 
@@ -251,6 +253,20 @@ def test_limite_maximo_do_schema():
     assert schema.effective_limit(10_000) == 500
     assert schema.effective_limit(None) == 500
     assert base.effective_limit(10_000) == 10_000
+
+
+def test_teto_padrao_so_vale_para_schema_sem_max_limit():
+    """A rede de segurança de quem chama: schema que não declara `max_limit` no
+    catálogo não fica sem teto nenhum — mas quem declara continua mandando."""
+    sem_teto = dataclasses.replace(vendas_schema(), max_limit=None)
+    com_teto = dataclasses.replace(vendas_schema(), max_limit=500)
+
+    assert sem_teto.effective_limit(None) is None  # sem teto e sem padrão, nada muda
+    assert sem_teto.effective_limit(None, 50_000) == 50_000
+    assert sem_teto.effective_limit(10_000, 50_000) == 10_000
+
+    assert com_teto.effective_limit(None, 50_000) == 500  # o do catálogo, não o padrão
+    assert com_teto.effective_limit(1_000, 100) == 500  # nem para baixo o padrão manda
 
 
 def test_colunas_da_resposta_seguem_a_ordem_pedida():
