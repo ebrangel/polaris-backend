@@ -1,30 +1,23 @@
 """Engines/clientes por `connection_ref` — "criação dos engines SQLAlchemy por
-datasource" (CLAUDE.md). Um par leve/pesado por `connection_ref` **relacional**
-(nunca por `DatasourceType`: dois datasets Postgres distintos, como
-`env:DW_VENDAS_PG_URL` e `env:APP_ESTOQUE_URL`, são bancos diferentes e não podem
-compartilhar pool — `docs/escalabilidade.md`); um `AsyncElasticsearch` por
-`connection_ref` de Elasticsearch.
+datasource" (CLAUDE.md). Um `AsyncEngine` por `connection_ref` **relacional** (nunca
+por `DatasourceType`: dois datasets Postgres distintos, como `env:DW_VENDAS_PG_URL` e
+`env:APP_ESTOQUE_URL`, são bancos diferentes e não podem compartilhar pool —
+`docs/escalabilidade.md`); um `AsyncElasticsearch` por `connection_ref` de
+Elasticsearch.
 
 Construir o `QueryExecutor` a partir de cada engine/cliente é do composition root
-(`main.py`), que também conhece os timeouts/limiar de custo (`Settings`).
+(`main.py`), que também conhece o timeout por datasource (`Settings`). Só o processo
+worker abre esses engines para executar consulta; a API os constrói apenas para o
+`DatasourceInspector` da publicação de catálogo.
 """
 
 from collections.abc import Iterable
-from dataclasses import dataclass
 
 from elasticsearch import AsyncElasticsearch
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from domain.models import Dataset, DatasourceType, Schema
 from infrastructure.config import resolve_connection_ref
-
-
-@dataclass(frozen=True, slots=True)
-class EnginePair:
-    """Os dois pools de um mesmo `connection_ref` — nunca compartilhados entre si."""
-
-    light: AsyncEngine
-    heavy: AsyncEngine
 
 
 def _representative_datasets(schemas: Iterable[Schema]) -> dict[str, Dataset]:
@@ -40,19 +33,15 @@ def _representative_datasets(schemas: Iterable[Schema]) -> dict[str, Dataset]:
 def build_relational_engines(
     schemas: Iterable[Schema],
     *,
-    light_pool_size: int = 20,
-    heavy_pool_size: int = 3,
-) -> dict[str, EnginePair]:
-    """Um `EnginePair` por `connection_ref` cujo datasource é Postgres/Oracle."""
-    engines: dict[str, EnginePair] = {}
+    pool_size: int = 10,
+) -> dict[str, AsyncEngine]:
+    """Um `AsyncEngine` por `connection_ref` cujo datasource é Postgres/Oracle."""
+    engines: dict[str, AsyncEngine] = {}
     for connection_ref, dataset in _representative_datasets(schemas).items():
         if dataset.datasource.type is DatasourceType.ELASTICSEARCH:
             continue
         url = resolve_connection_ref(connection_ref)
-        engines[connection_ref] = EnginePair(
-            light=create_async_engine(url, pool_size=light_pool_size),
-            heavy=create_async_engine(url, pool_size=heavy_pool_size),
-        )
+        engines[connection_ref] = create_async_engine(url, pool_size=pool_size)
     return engines
 
 
@@ -67,10 +56,9 @@ def build_elasticsearch_clients(schemas: Iterable[Schema]) -> dict[str, AsyncEla
     return clients
 
 
-async def dispose_relational_engines(engines: dict[str, EnginePair]) -> None:
-    for pair in engines.values():
-        await pair.light.dispose()
-        await pair.heavy.dispose()
+async def dispose_relational_engines(engines: dict[str, AsyncEngine]) -> None:
+    for engine in engines.values():
+        await engine.dispose()
 
 
 async def close_elasticsearch_clients(clients: dict[str, AsyncElasticsearch]) -> None:

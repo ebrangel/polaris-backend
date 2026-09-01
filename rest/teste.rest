@@ -2,6 +2,9 @@ GET http://localhost:8000/v1/catalog
 
 
 ###
+# Toda consulta é enfileirada. A API aguarda o job por INLINE_WAIT_SECONDS (2s):
+# se concluir, resposta 200 com o resultado; se não, 202 + poll_url para acompanhar
+# em GET /v1/query/{query_id}.
 POST http://localhost:8000/v1/query HTTP/1.1
 content-type: application/json
 

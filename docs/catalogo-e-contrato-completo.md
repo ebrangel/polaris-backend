@@ -223,7 +223,12 @@ Se `query` estiver presente, os demais parâmetros são ignorados (evita ambigui
 - Tamanho de URL limitado (~2000 caracteres na prática, entre navegadores/proxies) — filtros com listas grandes (ex: `in` com centenas de valores) devem usar POST
 - Como `filter[campo][operador]` usa chaves dinâmicas, a rota GET recebe o `Request` cru e faz o parsing manualmente — a documentação OpenAPI desses parâmetros precisa ser escrita à mão, não é inferida automaticamente pelo FastAPI
 
-### 2.3 Resposta — caso síncrono (consulta rápida ou em cache)
+> **Redesenho — iteração 1**: toda consulta é enfileirada. A API aguarda o job por
+> `INLINE_WAIT_SECONDS` (padrão 2s) e devolve o formato da seção 2.3 com `200` se
+> concluiu nesse tempo, ou o `202` da seção 2.4 se não. "Caso síncrono" abaixo =
+> "concluiu dentro da janela inline, ou veio do cache". Não há mais estimativa de custo.
+
+### 2.3 Resposta — caso concluído dentro da janela inline (ou em cache)
 
 ```json
 {
@@ -312,7 +317,7 @@ Três respostas nunca saem em CSV, qualquer que seja o formato pedido:
 O download de uma consulta pesada é, então: submeter, acompanhar `GET /v1/query/{query_id}`
 em JSON e, quando `completed`, baixar com `GET /v1/query/{query_id}?format=csv`.
 
-### 2.4 Resposta — caso assíncrono (consulta pesada)
+### 2.4 Resposta — job ainda em processamento
 
 ```json
 {
@@ -322,9 +327,9 @@ em JSON e, quando `completed`, baixar com `GET /v1/query/{query_id}?format=csv`.
 }
 ```
 
-Retornado com HTTP `202 Accepted`. O cliente então consulta `GET /v1/query/{query_id}` até `status: "completed"` (ou `"failed"`), quando a resposta assume o formato da seção 2.3.
+Retornado com HTTP `202 Accepted` quando o job não concluiu dentro de `INLINE_WAIT_SECONDS`. O cliente então consulta `GET /v1/query/{query_id}` até `status: "completed"` (ou `"failed"`), quando a resposta assume o formato da seção 2.3.
 
-Critério sugerido para decidir síncrono vs. assíncrono: depois de resolver o dataset, estimar custo da query (cardinalidade das dimensões e ausência de filtros seletivos, específico do datasource daquele dataset) antes de executar; acima de um limiar, enfileirar.
+Toda consulta passa pela fila — não há critério de custo nem decisão síncrono/assíncrono. Se a fila estiver no teto (`MAX_QUEUE_DEPTH`), a submissão é recusada com `429`/`rate_limited` (seção 2.5).
 
 ### 2.4a Export de consulta pesada — arquivo e URL de download
 

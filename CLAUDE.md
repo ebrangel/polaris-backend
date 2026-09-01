@@ -8,12 +8,12 @@ API REST para consultas analíticas sobre tabelas em múltiplos bancos (modelo e
 - Catálogo de metadados versionado em YAML (git) e replicado em **Postgres** para leitura rápida
 - Cada schema expõe um **modelo lógico** (dimensões/medidas canônicas) atendido por **um ou mais datasets**, cada um com seu próprio datasource; o resolvedor escolhe em tempo de requisição o primeiro dataset (por ordem de declaração) cujo conjunto de campos cobre o que foi pedido
 - Query builder que gera SQL parametrizado via **SQLAlchemy Core** para os bancos relacionais (Postgres, Oracle); **Elasticsearch** é atendido por um adapter dedicado, fora do caminho SQL
-- Caminho síncrono para consultas leves e caminho assíncrono (fila + workers) para consultas pesadas
+- **Caminho único de execução**: toda consulta é enfileirada (fila + workers); só o worker conecta aos datasets. A API enfileira, aguarda o job por uma janela curta (`INLINE_WAIT_SECONDS`, padrão 2s) e devolve o resultado inline (`200`) se concluiu, ou `202` + `poll_url` se não. Não há classificação leve/pesada nem estimativa de custo.
 
 Documentos de referência (ler antes de implementar qualquer marco):
 - `docs/catalogo-e-contrato-completo.md` — formato YAML do catálogo (fatos, dimensões, joins, medidas, datasource, controle de acesso) e contrato completo da API (endpoints, schemas, erros)
 - `docs/pipeline-publicacao.md` — lógica de publicação incremental do catálogo (hash de conteúdo vs. banco Postgres)
-- `docs/escalabilidade.md` — separação de pools leve/pesado por datasource, fila de workers, ajustes recomendados por engine
+- `docs/escalabilidade.md` — pool de conexões por datasource no worker, fila de workers, ajustes recomendados por engine
 
 ## Arquitetura de código: Clean Architecture
 
@@ -86,8 +86,8 @@ chamadas com `await`. Rotas FastAPI são `async def` e chamam os use cases assí
 - Datasets com `datasource.type: elasticsearch` só suportam modelo plano (sem fato/dimensão) e são executados por um `QueryExecutor` dedicado, não pelo adapter SQLAlchemy.
 - `POST /v1/query` e `GET /v1/query` convergem para o mesmo objeto `QueryRequest` (domain) antes de chegar no use case — nenhuma lógica de negócio duplicada entre as duas rotas.
 - O **formato de saída** (JSON ou CSV) é negociado na borda HTTP e nunca entra no `QueryRequest`. `query_id` é o hash da requisição e serve de chave de cache e de identificador do job assíncrono; se o formato fizesse parte dela, a mesma consulta em JSON e em CSV viraria dois `query_id` distintos — cache e execução duplicados por uma diferença que não muda o SQL gerado. Formato é representação do resultado, não parte da consulta, e por isso vive em querystring/header, nunca no corpo.
-- Toda consulta pesada deve passar pelo caminho assíncrono (fila); o critério de "pesada" está descrito em `docs/escalabilidade.md`.
-- Quem materializa resultado grande é o **worker**, nunca o processo da API: todo job pesado concluído grava um CSV via o port `ResultExporter`, e a API só entrega o arquivo pronto em `GET /v1/query/{query_id}/download`. O export é gerado para todo job, e não só para quem pediu CSV — o `arq` deduplica por `query_id`, então condicionar o arquivo à intenção do cliente perderia a intenção da segunda de duas requisições idênticas.
+- Toda consulta passa pela fila; não há caminho síncrono nem classificação leve/pesada. `ExecuteQuery` valida, autoriza, aplica o teto de `limit`, lê o cache, resolve o dataset (só para nomear o job), checa o backpressure de fila (`MAX_QUEUE_DEPTH` → `429`), enfileira e aguarda o resultado por `INLINE_WAIT_SECONDS` via `arq.jobs.Job(...).result(timeout=...)`. Só o processo worker abre engine/cliente de datasource para executar consulta.
+- Quem executa a consulta, materializa o resultado e **grava no cache** é o **worker** (`RunQueuedQuery`) — é o único escritor do `CacheGateway`; a API só lê o cache. Todo job concluído também grava um CSV via o port `ResultExporter`, e a API entrega o arquivo pronto em `GET /v1/query/{query_id}/download`. O export é gerado para todo job, e não só para quem pediu CSV — o `arq` deduplica por `query_id`, então condicionar o arquivo à intenção do cliente perderia a intenção da segunda de duas requisições idênticas.
 
 ## Plano de execução sugerido (marcos)
 
@@ -123,8 +123,10 @@ Trabalhar um marco por vez; cada um deve ser testável e revisável isoladamente
 
 ### Marco 7 — Adapters: cache e fila
 - `RedisCacheGateway` (implementa `CacheGateway`) e `ArqJobQueue` (implementa `JobQueue`) — `arq` no lugar de Celery: é async-nativo sobre Redis, o que evita pontes `asyncio.to_thread` num port inteiramente `async def` (convenção de assincronia, acima); `docs/escalabilidade.md` já admite "Celery+Redis ou RQ" como alternativas equivalentes
-- Critério de decisão leve/pesada (custo estimado da consulta, calculado por datasource) dentro do use case `ExecuteQuery`, delegando ao `JobQueue` quando pesada
-- Pool de conexões dedicado por datasource nos executores (Marco 5)
+- `ExecuteQuery` enfileira toda consulta e aguarda o job por `INLINE_WAIT_SECONDS` (`JobQueue.wait_for_result`, sobre `arq.jobs.Job(...).result(timeout=...)`); backpressure global de fila cheia (`MAX_QUEUE_DEPTH` → `429`). O worker (`RunQueuedQuery`) é o único escritor do `CacheGateway`.
+- Pool de conexões por datasource nos executores (Marco 5), aberto só pelo processo worker
+
+  > **Redesenho — iteração 1** (posterior ao Marco 11): removidos o estimador de custo (`estimate_cost`/`QueryCost`) e a classificação leve/pesada (`ExecutionProfile`, pools leve/pesado). A API não executa mais consulta — precisa apenas de `CATALOG_DB_URL`, `REDIS_URL`, `INTERNAL_TOKEN` (+ tuning); ainda abre engine de datasource só para o `DatasourceInspector` da publicação de catálogo (`build_inspectors`), a mover para fora da API num retrabalho futuro do Marco 8.
 
 ### Marco 8 — Adapters + Infraestrutura: catálogo e pipeline de publicação
 - `PostgresCatalogRepository` (implementa `CatalogRepository`)

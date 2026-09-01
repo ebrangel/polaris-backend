@@ -10,8 +10,7 @@ from fixtures import vendas_schema_com_canal
 
 from adapters.api import create_app
 from application.use_cases import ExecuteQuery, ResolveDataset
-from domain.errors import QueryTimeoutError
-from domain.models import Catalog
+from domain.models import Catalog, QueryResult
 
 
 def _erro(response):
@@ -102,7 +101,6 @@ def test_no_dataset_available_422_com_o_exemplo_da_secao_2_5(executor, cache, jo
     execute_query = ExecuteQuery(
         catalog=catalog,
         resolve_dataset=ResolveDataset(),
-        executors={"env:DW_VENDAS_PG_URL": executor, "env:DW_VENDAS_ORACLE_URL": executor},
         cache=cache,
         job_queue=job_queue,
     )
@@ -127,15 +125,23 @@ def test_no_dataset_available_422_com_o_exemplo_da_secao_2_5(executor, cache, jo
     )
 
 
-def test_query_timeout_504(client, executor, financeiro):
-    executor.raises = QueryTimeoutError("A consulta excedeu 5.0s.")
+def test_job_que_falha_no_tempo_volta_status_failed_em_json(client, job_queue, financeiro):
+    """Toda consulta passa pela fila: um timeout do datasource é falha de job, não um
+    erro síncrono. Concluída dentro da janela inline com falha, a resposta é
+    `200 {status: failed}` (seção 2.4/2.5), não um envelope `problem+json`.
+    """
+    job_queue.default_result = QueryResult.failed(
+        "q_timeout", error="A consulta ao dataset 'vendas_agregado_uf' excedeu 300.0s."
+    )
 
     response = client.post(
         "/v1/query", json={"schema": "vendas", "dimensions": ["sigla_uf"]}, headers=financeiro
     )
 
-    assert response.status_code == 504
-    assert _erro(response)["type"] == "query_timeout"
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "failed"
+    assert "excedeu" in body["error"]
 
 
 # --- Erros de forma: não são DomainError, mas usam o mesmo envelope --------------------

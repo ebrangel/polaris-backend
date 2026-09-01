@@ -17,7 +17,7 @@ from application.ports.catalog_invalidator import CatalogInvalidator
 from application.ports.catalog_repository import CatalogRepository
 from application.ports.datasource_inspector import DatasourceInspector
 from application.ports.job_queue import JobQueue
-from application.ports.query_executor import ExecutionProfile, QueryCost, QueryExecutor
+from application.ports.query_executor import QueryExecutor
 from application.ports.rate_limiter import RateLimiter
 from application.ports.result_exporter import ResultExporter
 from domain.errors import QueryTimeoutError
@@ -41,9 +41,9 @@ PORT_METHODS = {
         InMemoryCatalogRepository,
         ("get_active_version", "list_active_versions", "publish_new_version"),
     ),
-    QueryExecutor: (StubQueryExecutor, ("execute", "estimate_cost")),
+    QueryExecutor: (StubQueryExecutor, ("execute",)),
     CacheGateway: (InMemoryCacheGateway, ("get", "set", "delete", "stats")),
-    JobQueue: (InMemoryJobQueue, ("enqueue", "get_status", "depth")),
+    JobQueue: (InMemoryJobQueue, ("enqueue", "wait_for_result", "get_status", "depth")),
     DatasourceInspector: (StubDatasourceInspector, ("missing_fields",)),
     CatalogInvalidator: (InMemoryCatalogInvalidator, ("publish",)),
     RateLimiter: (InMemoryRateLimiter, ("allow",)),
@@ -123,7 +123,7 @@ def _real_query_executors():
     engine = create_async_engine("postgresql+psycopg://user:pass@localhost/db")
     client = AsyncElasticsearch(hosts=["http://localhost:9200"])
     return [
-        SQLAlchemyQueryExecutor(light_engine=engine, heavy_engine=engine),
+        SQLAlchemyQueryExecutor(engine=engine),
         ElasticsearchQueryExecutor(client=client),
     ]
 
@@ -139,17 +139,8 @@ def test_executor_real_satisfaz_o_protocol(impl):
     "impl", _real_query_executors(), ids=lambda impl: type(impl).__name__
 )
 def test_executor_real_tem_a_mesma_assinatura_do_port(impl):
-    for method_name in ("execute", "estimate_cost"):
+    for method_name in ("execute",):
         _assert_signature_matches(QueryExecutor, method_name, impl)
-
-
-# --- QueryCost ---------------------------------------------------------------------------
-
-
-def test_query_cost_is_heavy_compara_score_e_limiar():
-    assert not QueryCost(score=10, threshold=100).is_heavy
-    assert QueryCost(score=150, threshold=100).is_heavy
-    assert not QueryCost(score=100, threshold=100).is_heavy  # empate não é pesada
 
 
 # --- CacheGateway ------------------------------------------------------------------------
@@ -235,6 +226,34 @@ async def test_job_queue_get_status_de_query_id_desconhecido_e_none():
     assert await queue.get_status("q_000000") is None
 
 
+async def test_job_queue_wait_for_result_devolve_processing_enquanto_o_job_roda():
+    queue = InMemoryJobQueue()
+    request = QueryRequest(schema="vendas", dimensions=("sigla_uf",))
+    await queue.enqueue(request, dataset_name="vendas_agregado_uf")
+
+    result = await queue.wait_for_result(request.query_id, timeout=0.01)
+
+    assert result.status.value == "processing"
+    assert result.query_id == request.query_id
+
+
+async def test_job_queue_wait_for_result_devolve_o_resultado_final(sample_result):
+    queue = InMemoryJobQueue()
+    request = QueryRequest(schema="vendas", dimensions=("sigla_uf",), measures=("valor_total",))
+    await queue.enqueue(request, dataset_name="vendas_agregado_uf")
+    queue.resolve(request.query_id, sample_result)
+
+    assert await queue.wait_for_result(request.query_id, timeout=0.01) == sample_result
+
+
+async def test_job_queue_wait_for_result_de_query_id_desconhecido_e_processing():
+    queue = InMemoryJobQueue()
+
+    result = await queue.wait_for_result("q_000000", timeout=0.01)
+
+    assert result.status.value == "processing"
+
+
 async def test_job_queue_depth_acompanha_jobs_pendentes(sample_result):
     queue = InMemoryJobQueue()
     a = QueryRequest(schema="vendas", dimensions=("sigla_uf",))
@@ -306,7 +325,7 @@ async def test_query_executor_execute_devolve_o_resultado_programado(sample_resu
     result = await executor.execute(dataset, request, columns)
 
     assert result == sample_result
-    assert executor.calls == [(dataset, request, columns, ExecutionProfile.LIGHT)]
+    assert executor.calls == [(dataset, request, columns)]
 
 
 async def test_query_executor_execute_sem_resultado_programado_monta_um_completed():
@@ -329,28 +348,6 @@ async def test_query_executor_propaga_erro_programado():
 
     with pytest.raises(QueryTimeoutError):
         await executor.execute(dataset, request, ())
-
-
-async def test_query_executor_estimate_cost_devolve_o_custo_programado():
-    cost = QueryCost(score=500, threshold=100, detail="cardinalidade alta")
-    executor = StubQueryExecutor(cost=cost)
-    dataset = vendas_agregado_uf()
-    request = QueryRequest(schema="vendas", dimensions=("sigla_uf",))
-
-    estimated = await executor.estimate_cost(dataset, request)
-
-    assert estimated == cost
-    assert estimated.is_heavy
-
-
-async def test_query_executor_recebe_o_profile_pesado_da_fila():
-    executor = StubQueryExecutor()
-    dataset = vendas_agregado_uf()
-    request = QueryRequest(schema="vendas", dimensions=("sigla_uf",))
-
-    await executor.execute(dataset, request, (), profile=ExecutionProfile.HEAVY)
-
-    assert executor.calls[0][3] is ExecutionProfile.HEAVY
 
 
 # --- RateLimiter (Marco 9) -----------------------------------------------------------------

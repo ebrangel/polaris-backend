@@ -10,7 +10,6 @@ from datetime import UTC, datetime, timedelta
 
 from application.catalog_codec import decompile_schema
 from application.ports.cache_gateway import CacheStats
-from application.ports.query_executor import ExecutionProfile, QueryCost
 from application.ports.result_exporter import ExportMetadata
 from domain.models import CatalogVersion, Dataset, QueryRequest, QueryResult, QueryStatus
 
@@ -56,28 +55,25 @@ class InMemoryCatalogRepository:
 
 
 class StubQueryExecutor:
-    """Fake do `QueryExecutor`: resultado e custo programáveis, chamadas registradas."""
+    """Fake do `QueryExecutor`: resultado programável, chamadas registradas."""
 
     def __init__(
         self,
         result: QueryResult | None = None,
-        cost: QueryCost | None = None,
         *,
         raises: Exception | None = None,
     ) -> None:
         self.result = result
-        self.cost = cost if cost is not None else QueryCost(score=0.0, threshold=1.0)
         self.raises = raises
-        self.calls: list[tuple[Dataset, QueryRequest, tuple, ExecutionProfile]] = []
+        self.calls: list[tuple[Dataset, QueryRequest, tuple]] = []
 
     async def execute(
         self,
         dataset: Dataset,
         request: QueryRequest,
         columns: tuple,
-        profile: ExecutionProfile = ExecutionProfile.LIGHT,
     ) -> QueryResult:
-        self.calls.append((dataset, request, columns, profile))
+        self.calls.append((dataset, request, columns))
         if self.raises is not None:
             raise self.raises
         if self.result is not None:
@@ -88,9 +84,6 @@ class StubQueryExecutor:
             rows=(),
             dataset_used=dataset.name,
         )
-
-    async def estimate_cost(self, dataset: Dataset, request: QueryRequest) -> QueryCost:
-        return self.cost
 
 
 class InMemoryCacheGateway:
@@ -232,17 +225,30 @@ class InMemoryResultExporter:
 
 
 class InMemoryJobQueue:
-    """Fake do `JobQueue`. `resolve()` simula um worker completando um job."""
+    """Fake do `JobQueue`. `resolve()` simula um worker completando um job.
+
+    `default_result` simula "o worker concluiu dentro da janela de espera inline":
+    quando setado, `wait_for_result` devolve esse resultado em vez de `processing`,
+    sem precisar chamar `resolve()` para cada `query_id`.
+    """
 
     def __init__(self) -> None:
         self._jobs: dict[str, QueryResult] = {}
         self.calls: list[tuple[QueryRequest, str]] = []
+        self.default_result: QueryResult | None = None
 
     async def enqueue(self, request: QueryRequest, dataset_name: str) -> QueryResult:
         self.calls.append((request, dataset_name))
-        result = QueryResult.processing(request.query_id)
-        self._jobs[request.query_id] = result
-        return result
+        self._jobs.setdefault(request.query_id, QueryResult.processing(request.query_id))
+        return QueryResult.processing(request.query_id)
+
+    async def wait_for_result(self, query_id: str, timeout: float) -> QueryResult:
+        job = self._jobs.get(query_id)
+        if job is not None and job.status is not QueryStatus.PROCESSING:
+            return job
+        if self.default_result is not None:
+            return self.default_result
+        return QueryResult.processing(query_id)
 
     async def get_status(self, query_id: str) -> QueryResult | None:
         return self._jobs.get(query_id)

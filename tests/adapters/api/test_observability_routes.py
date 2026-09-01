@@ -36,7 +36,6 @@ def observability_client(cache, job_queue, get_observability_snapshot) -> TestCl
     execute_query = ExecuteQuery(
         catalog=catalog,
         resolve_dataset=ResolveDataset(),
-        executors={},
         cache=cache,
         job_queue=job_queue,
     )

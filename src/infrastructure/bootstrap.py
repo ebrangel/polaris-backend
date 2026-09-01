@@ -74,7 +74,7 @@ class ApplicationContext:
     catalog_repository: CatalogRepository
     catalog_engine: AsyncEngine
     executors: dict[str, QueryExecutor]
-    relational_engines: dict[str, db.EnginePair]
+    relational_engines: dict[str, AsyncEngine]
     es_clients: dict[str, AsyncElasticsearch]
 
     async def dispose(self) -> None:
@@ -86,35 +86,31 @@ class ApplicationContext:
 async def build_context(settings: Settings) -> ApplicationContext:
     """Lê o catálogo ativo do Postgres e monta um `QueryExecutor` por `connection_ref`
     do catálogo — Postgres/Oracle via `SQLAlchemyQueryExecutor`, Elasticsearch via
-    `ElasticsearchQueryExecutor`, cada um com seu próprio par de engines leve/pesado
-    (`docs/escalabilidade.md`)."""
+    `ElasticsearchQueryExecutor`, cada um com um engine/cliente por datasource.
+
+    O processo worker usa os executores para executar consulta; a API os constrói
+    apenas para alimentar o `DatasourceInspector` da publicação de catálogo
+    (`build_inspectors`) — nunca para executar consulta."""
     catalog_engine = create_async_engine(settings.catalog_db_url)
     catalog_repository = PostgresCatalogRepository(catalog_engine)
     catalog = await LoadCatalog(catalog_repository)()
 
     schemas = list(catalog.schemas.values())
     relational_engines = db.build_relational_engines(
-        schemas,
-        light_pool_size=settings.light_pool_size,
-        heavy_pool_size=settings.heavy_pool_size,
+        schemas, pool_size=settings.query_pool_size
     )
     es_clients = db.build_elasticsearch_clients(schemas)
 
     executors: dict[str, QueryExecutor] = {}
-    for connection_ref, engines in relational_engines.items():
+    for connection_ref, engine in relational_engines.items():
         executors[connection_ref] = SQLAlchemyQueryExecutor(
-            light_engine=engines.light,
-            heavy_engine=engines.heavy,
-            light_timeout_seconds=settings.light_timeout_seconds,
-            heavy_timeout_seconds=settings.heavy_timeout_seconds,
-            cost_threshold=settings.cost_threshold,
-            heuristic_threshold=settings.heuristic_cost_threshold,
+            engine=engine,
+            timeout_seconds=settings.query_timeout_seconds,
         )
     for connection_ref, client in es_clients.items():
         executors[connection_ref] = ElasticsearchQueryExecutor(
             client=client,
-            light_timeout_seconds=settings.light_timeout_seconds,
-            heavy_timeout_seconds=settings.heavy_timeout_seconds,
+            timeout_seconds=settings.query_timeout_seconds,
         )
 
     return ApplicationContext(
@@ -135,8 +131,8 @@ def build_inspectors(context: ApplicationContext) -> dict[str, DatasourceInspect
     inspecionados, em vez de falhar."""
     types = db.datasource_types(context.catalog.schemas.values())
     return {
-        connection_ref: PostgresInspector(engines.light)
-        for connection_ref, engines in context.relational_engines.items()
+        connection_ref: PostgresInspector(engine)
+        for connection_ref, engine in context.relational_engines.items()
         if types.get(connection_ref) is DatasourceType.POSTGRES
     }
 
@@ -171,21 +167,15 @@ def _build_lifespan(
         )
 
         job_queue_pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
-        job_queue = ArqJobQueue(job_queue_pool)
+        job_queue = ArqJobQueue(
+            job_queue_pool, result_poll_delay=settings.inline_wait_poll_delay
+        )
 
-        # Duas instâncias do mesmo adapter, config diferente — mesmo padrão de
-        # `executors`, um port com várias instâncias por chave (Marco 9).
         request_rate_limiter = RedisRateLimiter(
             cache_client,
             limit=settings.request_rate_limit,
             window_seconds=settings.request_rate_limit_window_seconds,
             key_prefix="ratelimit:request:",
-        )
-        heavy_query_rate_limiter = RedisRateLimiter(
-            cache_client,
-            limit=settings.heavy_query_rate_limit,
-            window_seconds=settings.heavy_query_rate_limit_window_seconds,
-            key_prefix="ratelimit:heavy:",
         )
 
         pubsub_client = Redis.from_url(settings.redis_url, decode_responses=True)
@@ -195,18 +185,18 @@ def _build_lifespan(
         app.state.catalog_repository = context.catalog_repository
         app.state.job_queue = job_queue
         app.state.result_exporter = build_result_exporter(settings)
+        # `context.executors` não entra aqui: a API não executa consulta (só o worker).
+        # Os executores/engines de `context` existem apenas para `build_inspectors`
+        # (validação da publicação de catálogo).
         app.state.execute_query = ExecuteQuery(
             catalog=context.catalog,
             resolve_dataset=ResolveDataset(),
-            executors=context.executors,
             cache=cache,
             job_queue=job_queue,
-            cache_ttl_seconds=settings.cache_ttl_seconds,
             request_rate_limiter=request_rate_limiter,
-            heavy_query_rate_limiter=heavy_query_rate_limiter,
-            max_heavy_queue_depth=settings.max_heavy_queue_depth,
-            slow_query_threshold_ms=settings.slow_query_threshold_ms,
+            max_queue_depth=settings.max_queue_depth,
             default_max_limit=settings.default_max_limit,
+            inline_wait_seconds=settings.inline_wait_seconds,
         )
         app.state.publish_catalog = PublishCatalog(
             repository=context.catalog_repository,
@@ -266,11 +256,22 @@ def create_worker_settings() -> type:
 
     async def provide_run_queued_query() -> RunQueuedQuery:
         context = await build_context(settings)
+        # O worker é o único escritor do cache de resultados (toda consulta passa pela
+        # fila). Cliente Redis dedicado, com os mesmos tetos que a API usava.
+        cache_client = Redis.from_url(settings.redis_url, decode_responses=True)
+        cache = RedisCacheGateway(
+            cache_client,
+            default_ttl_seconds=settings.cache_ttl_seconds,
+            max_rows=settings.cache_max_rows,
+            max_payload_bytes=settings.cache_max_payload_bytes,
+        )
         return RunQueuedQuery(
             catalog=context.catalog,
             executors=context.executors,
             slow_query_threshold_ms=settings.slow_query_threshold_ms,
             result_exporter=result_exporter,
+            cache=cache,
+            cache_ttl_seconds=settings.cache_ttl_seconds,
         )
 
     return build_worker_settings(

@@ -1,5 +1,8 @@
 """`POST /v1/query` e `GET /v1/query` — as três formas de submeter a mesma consulta
 (seções 2.2 e 2.2a) e o formato de resposta da seção 2.3.
+
+Toda consulta é enfileirada; o desfecho do job (concluído dentro da janela inline, ou
+ainda em processamento) é simulado por `InMemoryJobQueue.default_result`.
 """
 
 import json
@@ -40,8 +43,8 @@ def _resultado_da_secao_2_3(query_id: str) -> QueryResult:
 # --- POST /v1/query -----------------------------------------------------------------------
 
 
-def test_post_devolve_o_formato_da_secao_2_3(client, executor, financeiro):
-    executor.result = _resultado_da_secao_2_3("q_8f2a1c")
+def test_post_devolve_o_formato_da_secao_2_3(client, job_queue, financeiro):
+    job_queue.default_result = _resultado_da_secao_2_3("q_8f2a1c")
 
     response = client.post("/v1/query", json=PAYLOAD_SECAO_2_2, headers=financeiro)
 
@@ -64,9 +67,9 @@ def test_post_devolve_o_formato_da_secao_2_3(client, executor, financeiro):
     }
 
 
-def test_coluna_sem_format_omite_a_chave(client, executor, financeiro):
+def test_coluna_sem_format_omite_a_chave(client, job_queue, financeiro):
     """No exemplo da seção 2.3, `quantidade` não tem `format` — a chave não aparece."""
-    executor.result = _resultado_da_secao_2_3("q_8f2a1c")
+    job_queue.default_result = _resultado_da_secao_2_3("q_8f2a1c")
 
     colunas = client.post("/v1/query", json=PAYLOAD_SECAO_2_2, headers=financeiro).json()[
         "columns"
@@ -77,12 +80,12 @@ def test_coluna_sem_format_omite_a_chave(client, executor, financeiro):
     assert colunas[1]["format"] == "currency"
 
 
-def test_tipos_do_driver_sao_serializados(client, executor, financeiro):
+def test_tipos_do_driver_sao_serializados(client, job_queue, financeiro):
     """Os routers devolvem `JSONResponse` já montada (para controlar 200 vs. 202), o
     que contorna a serialização automática do FastAPI. Uma coluna `numeric` do Postgres
     chega como `Decimal` e uma `date` como `datetime.date` — sem conversão explícita a
     resposta quebraria com `TypeError`. `Decimal` vira string para não perder precisão."""
-    executor.result = QueryResult.completed(
+    job_queue.default_result = QueryResult.completed(
         query_id="q_tipos",
         columns=(
             Column(field="sigla_uf", type=DataType.STRING),
@@ -98,10 +101,11 @@ def test_tipos_do_driver_sao_serializados(client, executor, financeiro):
     assert response.json()["rows"] == [["2024-01-31", "458320.50"]]
 
 
-def test_post_chega_no_use_case_com_a_requisicao_traduzida(client, executor, financeiro):
+def test_post_chega_no_use_case_com_a_requisicao_traduzida(client, job_queue, financeiro):
     client.post("/v1/query", json=PAYLOAD_SECAO_2_2, headers=financeiro)
 
-    _, domain_request, _, _ = executor.calls[0]
+    domain_request, dataset_name = job_queue.calls[0]
+    assert dataset_name == "vendas_agregado_uf"
     assert domain_request.schema == "vendas"
     assert domain_request.dimensions == ("sigla_uf",)
     assert domain_request.measures == ("valor_total", "quantidade")
@@ -110,26 +114,23 @@ def test_post_chega_no_use_case_com_a_requisicao_traduzida(client, executor, fin
     assert domain_request.limit == 100
 
 
-def test_resposta_assincrona_da_secao_2_4_usa_202_e_poll_url(client, executor, financeiro):
-    """O `ExecuteQuery` do Marco 4 só devolve `completed`; a fila é do Marco 7. O
-    presenter já cobre o caso para que o enfileiramento não precise mexer no router."""
-    executor.result = QueryResult.processing("q_9d31be")
-
+def test_resposta_assincrona_da_secao_2_4_usa_202_e_poll_url(client, financeiro):
+    """Sem worker, a janela inline expira e `wait_for_result` devolve `processing` — o
+    router responde 202 + poll_url."""
     response = client.post("/v1/query", json=PAYLOAD_SECAO_2_2, headers=financeiro)
 
     assert response.status_code == 202
-    assert response.json() == {
-        "query_id": "q_9d31be",
-        "status": "processing",
-        "poll_url": "/v1/query/q_9d31be",
-    }
+    body = response.json()
+    assert body["status"] == "processing"
+    assert body["query_id"].startswith("q_")
+    assert body["poll_url"] == f"/v1/query/{body['query_id']}"
 
 
 # --- GET /v1/query, opção A: query=<json> ---------------------------------------------------
 
 
-def test_get_com_query_json_e_identico_ao_post(client, executor, financeiro):
-    executor.result = _resultado_da_secao_2_3("q_8f2a1c")
+def test_get_com_query_json_e_identico_ao_post(client, job_queue, financeiro):
+    job_queue.default_result = _resultado_da_secao_2_3("q_8f2a1c")
     do_post = client.post("/v1/query", json=PAYLOAD_SECAO_2_2, headers=financeiro).json()
 
     querystring = urlencode({"query": json.dumps(PAYLOAD_SECAO_2_2)})
@@ -139,7 +140,7 @@ def test_get_com_query_json_e_identico_ao_post(client, executor, financeiro):
     assert do_get.json() == do_post
 
 
-def test_query_json_tem_precedencia_sobre_os_parametros_planos(client, executor, financeiro):
+def test_query_json_tem_precedencia_sobre_os_parametros_planos(client, job_queue, financeiro):
     """"Se `query` estiver presente, os demais parâmetros são ignorados." (seção 2.2a)"""
     querystring = urlencode(
         {"query": json.dumps({"schema": "vendas", "dimensions": ["sigla_uf"]}), "limit": "7"}
@@ -147,9 +148,9 @@ def test_query_json_tem_precedencia_sobre_os_parametros_planos(client, executor,
 
     client.get(f"/v1/query?{querystring}", headers=financeiro)
 
-    _, domain_request, _, _ = executor.calls[0]
-    # O `limit=7` da querystring foi ignorado; o que chega no executor é o teto do
-    # schema `vendas` (seção 2.6), aplicado a toda requisição que não traz `limit`.
+    domain_request, _ = job_queue.calls[0]
+    # O `limit=7` da querystring foi ignorado; o que chega no job é o teto do schema
+    # `vendas` (seção 2.6), aplicado a toda requisição que não traz `limit`.
     assert domain_request.limit == 50_000
     assert domain_request.dimensions == ("sigla_uf",)
 
@@ -157,8 +158,8 @@ def test_query_json_tem_precedencia_sobre_os_parametros_planos(client, executor,
 # --- GET /v1/query, opção B: parâmetros planos ----------------------------------------------
 
 
-def test_get_com_parametros_planos_converge_para_a_mesma_resposta(client, executor, financeiro):
-    executor.result = _resultado_da_secao_2_3("q_8f2a1c")
+def test_get_com_parametros_planos_converge_para_a_mesma_resposta(client, job_queue, financeiro):
+    job_queue.default_result = _resultado_da_secao_2_3("q_8f2a1c")
     do_post = client.post("/v1/query", json=PAYLOAD_SECAO_2_2, headers=financeiro).json()
 
     do_get = client.get(
@@ -172,10 +173,9 @@ def test_get_com_parametros_planos_converge_para_a_mesma_resposta(client, execut
     assert do_get.json() == do_post
 
 
-def test_o_exemplo_literal_da_secao_2_2a(client, executor, financeiro):
+def test_o_exemplo_literal_da_secao_2_2a(client, job_queue, financeiro):
     """A URL exata do documento — `dimensions=sigla_uf,cargo` leva o resolvedor ao
-    `vendas_detalhado`, mas isso é invisível daqui: só se confere que a requisição
-    chegou traduzida."""
+    `vendas_detalhado`, visível aqui pelo nome do dataset no payload do job."""
     response = client.get(
         "/v1/query"
         "?schema=vendas&dimensions=sigla_uf,cargo&measures=valor_total"
@@ -183,9 +183,9 @@ def test_o_exemplo_literal_da_secao_2_2a(client, executor, financeiro):
         headers=financeiro,
     )
 
-    assert response.status_code == 200
-    dataset, domain_request, _, _ = executor.calls[0]
-    assert dataset.name == "vendas_detalhado"
+    assert response.status_code == 202
+    domain_request, dataset_name = job_queue.calls[0]
+    assert dataset_name == "vendas_detalhado"
     assert domain_request.dimensions == ("sigla_uf", "cargo")
     assert domain_request.filters[0].value == ("SP", "RJ")
 

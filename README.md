@@ -71,16 +71,13 @@ tenta montar o resultado combinando datasets.
 Joins acontecem **apenas dentro de um mesmo dataset e datasource**. Não existe join federado entre
 bancos diferentes.
 
-### Leve × pesada
+### Fila única
 
-Depois de resolver o dataset, a API estima o custo da consulta antes de executar:
-
-- **Postgres** — `EXPLAIN (FORMAT JSON)` real contra o banco
-- **Oracle / Elasticsearch** — heurística por contagem de campos (`dimensões × 10 − filtros × 5`)
-
-Acima do limiar (`COST_THRESHOLD`), a consulta vai para a fila de workers e a API responde `202` com
-`poll_url`. Abaixo, executa de forma síncrona no pool leve. Os dois caminhos usam **pools de conexão
-separados por datasource** — uma consulta pesada nunca segura conexões do caminho síncrono.
+Não há classificação leve/pesada nem estimativa de custo. **Toda consulta é enfileirada** e só o
+processo worker conecta aos datasets. A API enfileira, aguarda o job por `INLINE_WAIT_SECONDS`
+(padrão 2s) e devolve o resultado inline (`200`) se concluiu, ou `202` + `poll_url` se não — o
+cliente acompanha em `GET /v1/query/{query_id}`. Um pool de conexões por datasource (`QUERY_POOL_SIZE`),
+aberto pelo worker.
 
 ---
 
@@ -94,14 +91,13 @@ POST /v1/query
       ├─ 2. autoriza medidas pelo role ──────────► 403 forbidden_measure
       ├─ 3. aplica o teto de `limit` do schema
       ├─ 4. consulta o cache pelo `query_id` ────► 200 (meta.cached = true)
-      ├─ 5. resolve o dataset ───────────────────► 422 no_dataset_available
-      ├─ 6. estima o custo
-      │      ├─ pesada ─► fila cheia? ───────────► 429 rate_limited
-      │      │            limite do cliente? ────► 429 rate_limited
-      │      │            senão ─────────────────► 202 processing + poll_url
-      │      │                                        (o worker executa e grava o CSV)
-      │      └─ leve ─► executa (loga se lenta) ─► 200 completed
-      └─ 7. grava no cache
+      ├─ 5. resolve o dataset (só para nomear o job)
+      ├─ 6. fila cheia? (MAX_QUEUE_DEPTH) ───────► 429 rate_limited
+      ├─ 7. enfileira e aguarda até INLINE_WAIT_SECONDS
+      │      ├─ concluiu ────────────────────────► 200 completed
+      │      ├─ falhou ─────────────────────────► 200 failed
+      │      └─ ainda rodando ──────────────────► 202 processing + poll_url
+      └─ (o worker executa, grava no cache e o CSV)
 ```
 
 O `query_id` (`q_8f2a1c`) é o **hash SHA-256 da requisição canônica** — serve ao mesmo tempo como
@@ -261,7 +257,7 @@ como *"sem inspeção"* — são publicados, mas sem validação semântica. Se 
 # API
 uv run uvicorn main:app --reload
 
-# Worker de consultas pesadas (outro terminal)
+# Worker de consultas (outro terminal) — sem ele, nenhuma consulta conclui
 PROCESS_ROLE=worker uv run arq main.WorkerSettings
 ```
 
@@ -421,7 +417,7 @@ deixa um arquivo gravado pelo worker**, e a API só o entrega. O processo que at
 nunca segura o resultado inteiro em memória, e o arquivo sobrevive ao TTL da entrada do job no Redis.
 
 ```bash
-# 1. submete — se for pesada, volta 202 em JSON
+# 1. submete — se não concluir em INLINE_WAIT_SECONDS, volta 202 em JSON
 curl -s -X POST localhost:8000/v1/query \
   -H 'Content-Type: application/json' \
   -d '{"schema":"vendas","dimensions":["sigla_uf","cargo"],"measures":["valor_total"]}' | jq
@@ -661,9 +657,17 @@ documentação como objetos de domínio, e `tests/application/test_catalog_codec
 
 ## Status
 
-Os nove marcos do plano estão implementados: domínio, ports, resolução de dataset, execução de
-consulta, executores, controllers, cache e fila, catálogo e pipeline de publicação, e
-observabilidade.
+Os marcos 1–11 do plano estão implementados: domínio, ports, resolução de dataset, execução de
+consulta, executores, controllers, cache e fila, catálogo e pipeline de publicação,
+observabilidade, saída em CSV e export de consulta pesada.
+
+**Redesenho — iteração 1** (posterior ao Marco 11): removido o estimador de custo e a
+classificação leve/pesada. Toda consulta é enfileirada; só o worker conecta aos datasets; a API
+enfileira, aguarda o job por `INLINE_WAIT_SECONDS` e devolve `200` inline ou `202` + `poll_url`. O
+worker passou a ser o único escritor do cache. Env vars: saíram `LIGHT_*`, `COST_THRESHOLD`,
+`HEURISTIC_COST_THRESHOLD`, `HEAVY_QUERY_RATE_LIMIT*`; `HEAVY_TIMEOUT_SECONDS`→`QUERY_TIMEOUT_SECONDS`,
+`HEAVY_POOL_SIZE`→`QUERY_POOL_SIZE`, `MAX_HEAVY_QUEUE_DEPTH`→`MAX_QUEUE_DEPTH`; entrou
+`INLINE_WAIT_SECONDS` (+ `INLINE_WAIT_POLL_DELAY`).
 
 **Pontos deliberadamente fora de escopo** (e por quê):
 
@@ -677,9 +681,11 @@ observabilidade.
 - **Adapter de S3 para os exports** — o port `ResultExporter` existe e o adapter de filesystem o
   implementa; um de S3 entraria sem mudar contrato nenhum, e é o que libera deploy multi-nó sem
   volume compartilhado.
-- **Streaming de verdade no caminho síncrono** — o export do worker resolve o problema de memória
-  para consulta pesada, mas `?format=csv` numa consulta leve ainda materializa o resultado. O
-  `csv_stream` da seção 2.6 exige um port de execução por streaming, e resolveria tempo até o
-  primeiro byte, não pico de memória.
+- **Streaming de verdade** — o export do worker resolve o problema de memória, mas `?format=csv`
+  numa resposta inline ainda materializa o resultado. O `csv_stream` da seção 2.6 exige um port de
+  execução por streaming, e resolveria tempo até o primeiro byte, não pico de memória.
+- **Publicação de catálogo fora da API** — a API ainda abre um engine de datasource só para o
+  `DatasourceInspector` de `POST /v1/catalog` (introspecção, não execução de consulta). Movê-la
+  para a fila é retrabalho futuro do Marco 8.
 - **Delimitador configurável por requisição** — o presenter aceita `;` (o que o Excel em pt-BR
   espera), mas não há parâmetro HTTP para escolhê-lo; o padrão é a vírgula da RFC 4180.

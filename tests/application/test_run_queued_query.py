@@ -1,5 +1,5 @@
 """`RunQueuedQuery` — o lado worker da seção 2.4: recebe o dataset já resolvido pelo
-nome (não chama `ResolveDataset` de novo) e executa no perfil `HEAVY`.
+nome (não chama `ResolveDataset` de novo), executa, grava no cache e exporta.
 """
 
 import logging
@@ -7,13 +7,12 @@ import logging
 import pytest
 from fixtures import catalog, vendas_schema
 
-from application.ports.query_executor import ExecutionProfile
 from application.use_cases.run_queued_query import RunQueuedQuery
 from domain.models import Catalog, QueryRequest, QueryResult, QueryStatus
-from fakes import InMemoryResultExporter, StubQueryExecutor
+from fakes import InMemoryCacheGateway, InMemoryResultExporter, StubQueryExecutor
 
 
-async def test_executa_no_perfil_heavy():
+async def test_executa_o_dataset_recebido():
     stub = StubQueryExecutor()
     run = RunQueuedQuery(catalog=catalog(), executors={"env:DW_VENDAS_PG_URL": stub})
     request = QueryRequest(schema="vendas", dimensions=("sigla_uf",), measures=("valor_total",))
@@ -21,10 +20,9 @@ async def test_executa_no_perfil_heavy():
     result = await run(request, dataset_name="vendas_agregado_uf")
 
     assert result.status is QueryStatus.COMPLETED
-    dataset, domain_request, columns, profile = stub.calls[0]
+    dataset, domain_request, _columns = stub.calls[0]
     assert dataset.name == "vendas_agregado_uf"
     assert domain_request == request
-    assert profile is ExecutionProfile.HEAVY
 
 
 async def test_resolve_o_dataset_pelo_nome_nao_pela_cobertura():
@@ -114,6 +112,70 @@ async def test_sem_threshold_configurado_nunca_loga(caplog):
         await run(request, dataset_name="vendas_agregado_uf")
 
     assert caplog.records == []
+
+
+# --- Cache do resultado (o worker é o único escritor) --------------------------------------
+
+
+async def test_grava_no_cache_quando_completed():
+    cache = InMemoryCacheGateway()
+    run = RunQueuedQuery(
+        catalog=catalog(),
+        executors={"env:DW_VENDAS_PG_URL": StubQueryExecutor()},
+        cache=cache,
+        cache_ttl_seconds=3600,
+    )
+    request = QueryRequest(schema="vendas", dimensions=("sigla_uf",), measures=("valor_total",))
+
+    result = await run(request, dataset_name="vendas_agregado_uf")
+
+    assert await cache.get(request.query_id) == result
+
+
+async def test_nao_grava_no_cache_quando_failed():
+    cache = InMemoryCacheGateway()
+    failed = QueryResult.failed("q_falhou1", error="erro no datasource")
+    run = RunQueuedQuery(
+        catalog=catalog(),
+        executors={"env:DW_VENDAS_PG_URL": StubQueryExecutor(result=failed)},
+        cache=cache,
+    )
+    request = QueryRequest(schema="vendas", dimensions=("sigla_uf",))
+
+    await run(request, dataset_name="vendas_agregado_uf")
+
+    assert await cache.get(request.query_id) is None
+
+
+async def test_sem_cache_configurado_nao_grava():
+    run = RunQueuedQuery(
+        catalog=catalog(), executors={"env:DW_VENDAS_PG_URL": StubQueryExecutor()}
+    )
+    request = QueryRequest(schema="vendas", dimensions=("sigla_uf",), measures=("valor_total",))
+
+    result = await run(request, dataset_name="vendas_agregado_uf")
+
+    assert result.status is QueryStatus.COMPLETED
+
+
+async def test_falha_ao_gravar_no_cache_nao_derruba_o_job(caplog):
+    class _ExplodingCache(InMemoryCacheGateway):
+        async def set(self, key, result, ttl_seconds=None):
+            raise ConnectionError("redis fora do ar")
+
+    run = RunQueuedQuery(
+        catalog=catalog(),
+        executors={"env:DW_VENDAS_PG_URL": StubQueryExecutor()},
+        cache=_ExplodingCache(),
+        cache_ttl_seconds=3600,
+    )
+    request = QueryRequest(schema="vendas", dimensions=("sigla_uf",), measures=("valor_total",))
+
+    with caplog.at_level(logging.WARNING):
+        result = await run(request, dataset_name="vendas_agregado_uf")
+
+    assert result.status is QueryStatus.COMPLETED
+    assert "falha ao gravar" in caplog.text
 
 
 # --- Export do resultado (seção 2.4a) ---------------------------------------------------

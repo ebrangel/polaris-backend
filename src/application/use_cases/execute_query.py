@@ -2,26 +2,25 @@
 
 (0) limitar por cliente (Marco 9) → (1) validar contra o modelo lógico → (2) autorizar
 → (3) aplicar o teto de `limit` do schema → (4) checar o cache pelo `query_id` → (5)
-resolver o dataset → (6) estimar custo e enfileirar se pesada, com backpressure e
-limite de cliente próprios (seção 2.4 + Marco 9) → (7) executar, logando se lenta → (8)
-gravar no cache.
+resolver o dataset → (6) backpressure de fila cheia (`429`) → (7) enfileirar → (8)
+aguardar o job por uma janela curta (`inline_wait_seconds`): concluiu, devolve o
+resultado (`200`); não concluiu, devolve `processing` e a borda HTTP responde `202` +
+poll_url.
+
+Não há mais caminho síncrono nem estimativa de custo: toda consulta passa pela fila, e
+quem executa e grava no cache é o worker (`RunQueuedQuery`). Este use case só lê o
+cache.
 """
 
-import logging
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from dataclasses import replace
 
 from application.ports.cache_gateway import CacheGateway
 from application.ports.job_queue import JobQueue
-from application.ports.query_executor import QueryExecutor
 from application.ports.rate_limiter import RateLimiter
-from application.use_cases._executor_lookup import executor_for
-from application.use_cases._slow_query_log import log_if_slow
 from application.use_cases.resolve_dataset import ResolveDataset
 from domain.errors import RateLimitedError
-from domain.models import Catalog, QueryRequest, QueryResult, QueryStatus
-
-logger = logging.getLogger(__name__)
+from domain.models import Catalog, QueryRequest, QueryResult
 
 
 class ExecuteQuery:
@@ -33,34 +32,30 @@ class ExecuteQuery:
         self,
         catalog: Catalog,
         resolve_dataset: ResolveDataset,
-        executors: Mapping[str, QueryExecutor],
         cache: CacheGateway,
         job_queue: JobQueue,
-        cache_ttl_seconds: int | None = None,
         request_rate_limiter: RateLimiter | None = None,
-        heavy_query_rate_limiter: RateLimiter | None = None,
-        max_heavy_queue_depth: int | None = None,
-        slow_query_threshold_ms: int | None = None,
+        max_queue_depth: int | None = None,
         default_max_limit: int | None = None,
+        inline_wait_seconds: float = 2.0,
     ) -> None:
-        """Os quatro parâmetros de observabilidade/rate limiting (Marco 9) são opcionais
-        — sem eles, o comportamento é idêntico ao dos Marcos 4-8: nenhum limite, nenhum
-        log de consulta lenta.
+        """`request_rate_limiter` e `max_queue_depth` (Marco 9) são opcionais — sem eles
+        nenhum limite é aplicado.
 
         `default_max_limit` é o teto de linhas aplicado a schema que não declara
         `max_limit` no catálogo — a rede que impede um schema recém-publicado de
-        executar sem `LIMIT` nenhum e materializar a tabela inteira em memória."""
+        executar sem `LIMIT` nenhum e materializar a tabela inteira em memória.
+
+        `inline_wait_seconds` é quanto a API aguarda o job concluir antes de devolver
+        `202` + poll_url (padrão 2s)."""
         self._catalog = catalog
         self._resolve_dataset = resolve_dataset
-        self._executors = executors
         self._cache = cache
         self._job_queue = job_queue
-        self._cache_ttl_seconds = cache_ttl_seconds
         self._request_rate_limiter = request_rate_limiter
-        self._heavy_query_rate_limiter = heavy_query_rate_limiter
-        self._max_heavy_queue_depth = max_heavy_queue_depth
-        self._slow_query_threshold_ms = slow_query_threshold_ms
+        self._max_queue_depth = max_queue_depth
         self._default_max_limit = default_max_limit
+        self._inline_wait_seconds = inline_wait_seconds
 
     async def __call__(
         self, request: QueryRequest, *, roles: Iterable[str], client_id: str
@@ -87,52 +82,19 @@ class ExecuteQuery:
         if cached is not None:
             return replace(cached, meta=replace(cached.meta, cached=True))
 
+        # Só para nomear o dataset no payload do job — `ResolveDataset` é síncrono e puro
+        # (percorre um `Schema` já carregado), não faz I/O nem abre engine.
         dataset = self._resolve_dataset(schema, request)
-        columns = schema.columns_for(request)
-        executor = executor_for(self._executors, dataset)
 
-        # "Depois de resolver o dataset, estimar custo ... antes de executar; acima de
-        # um limiar, enfileirar" (seção 2.4). Só depois do cache: um acerto não paga o
-        # custo de estimar (que pode ir ao banco — EXPLAIN, Marco 7).
-        cost = await executor.estimate_cost(dataset, request)
-        if cost.is_heavy:
-            if (
-                self._max_heavy_queue_depth is not None
-                and await self._job_queue.depth() >= self._max_heavy_queue_depth
-            ):
-                # Backpressure global (`docs/escalabilidade.md`: "Fila cheia →
-                # backpressure: 429") — não é por cliente, então nem consulta o
-                # `heavy_query_rate_limiter`.
-                raise RateLimitedError("A fila de consultas pesadas está cheia.")
-            if self._heavy_query_rate_limiter is not None:
-                if not await self._heavy_query_rate_limiter.allow(client_id):
-                    raise RateLimitedError(
-                        f"Limite de consultas pesadas em fila excedido para o "
-                        f"cliente '{client_id}'."
-                    )
-            return await self._job_queue.enqueue(request, dataset.name)
+        if (
+            self._max_queue_depth is not None
+            and await self._job_queue.depth() >= self._max_queue_depth
+        ):
+            # Backpressure global (`docs/escalabilidade.md`: "Fila cheia →
+            # backpressure: 429") — vale para qualquer consulta.
+            raise RateLimitedError("A fila de consultas está cheia.")
 
-        result = await executor.execute(dataset, request, columns)
-        log_if_slow(
-            result, schema_name=schema.name, threshold_ms=self._slow_query_threshold_ms
+        await self._job_queue.enqueue(request, dataset.name)
+        return await self._job_queue.wait_for_result(
+            request.query_id, self._inline_wait_seconds
         )
-
-        if result.status is QueryStatus.COMPLETED:
-            await self._cache_result(request.query_id, result)
-
-        return result
-
-    async def _cache_result(self, query_id: str, result: QueryResult) -> None:
-        """Gravar no cache é otimização — nunca pode derrubar resposta já calculada.
-
-        Mesmo raciocínio do export em `RunQueuedQuery`: o resultado existe, o cliente
-        tem direito a ele. Um resultado grande demais para o Redis (valor acima do teto
-        do servidor), uma indisponibilidade momentânea ou um teto do próprio adapter
-        custam, no máximo, um acerto de cache na próxima requisição igual.
-        """
-        try:
-            await self._cache.set(query_id, result, self._cache_ttl_seconds)
-        except Exception:
-            logger.warning(
-                "falha ao gravar a consulta %s no cache", query_id, exc_info=True
-            )

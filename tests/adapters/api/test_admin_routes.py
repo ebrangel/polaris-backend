@@ -42,7 +42,6 @@ def admin_client(repository, publish_catalog) -> TestClient:
     execute_query = ExecuteQuery(
         catalog=catalog,
         resolve_dataset=ResolveDataset(),
-        executors={},
         cache=InMemoryCacheGateway(),
         job_queue=InMemoryJobQueue(),
     )

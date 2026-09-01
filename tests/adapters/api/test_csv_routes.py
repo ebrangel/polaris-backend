@@ -38,8 +38,8 @@ def _resultado(query_id: str = "q_8f2a1c") -> QueryResult:
 # --- POST /v1/query -----------------------------------------------------------------------
 
 
-def test_post_com_format_csv(client, executor, financeiro):
-    executor.result = _resultado()
+def test_post_com_format_csv(client, job_queue, financeiro):
+    job_queue.default_result = _resultado()
 
     response = client.post("/v1/query?format=csv", json=PAYLOAD, headers=financeiro)
 
@@ -48,8 +48,8 @@ def test_post_com_format_csv(client, executor, financeiro):
     assert response.text == CSV_ESPERADO
 
 
-def test_post_negocia_por_accept(client, executor, financeiro):
-    executor.result = _resultado()
+def test_post_negocia_por_accept(client, job_queue, financeiro):
+    job_queue.default_result = _resultado()
 
     response = client.post(
         "/v1/query", json=PAYLOAD, headers={**financeiro, "Accept": "text/csv"}
@@ -59,8 +59,8 @@ def test_post_negocia_por_accept(client, executor, financeiro):
     assert response.text == CSV_ESPERADO
 
 
-def test_format_explicito_vence_o_accept(client, executor, financeiro):
-    executor.result = _resultado()
+def test_format_explicito_vence_o_accept(client, job_queue, financeiro):
+    job_queue.default_result = _resultado()
 
     response = client.post(
         "/v1/query?format=json", json=PAYLOAD, headers={**financeiro, "Accept": "text/csv"}
@@ -70,9 +70,9 @@ def test_format_explicito_vence_o_accept(client, executor, financeiro):
     assert response.json()["rows"] == [["SP", 458320.50, 1204], ["RJ", 212904.10, 588]]
 
 
-def test_sem_format_continua_json(client, executor, financeiro):
+def test_sem_format_continua_json(client, job_queue, financeiro):
     """O formato de saída é aditivo: quem não pede nada recebe a seção 2.3 como antes."""
-    executor.result = _resultado()
+    job_queue.default_result = _resultado()
 
     response = client.post("/v1/query", json=PAYLOAD, headers=financeiro)
 
@@ -80,8 +80,8 @@ def test_sem_format_continua_json(client, executor, financeiro):
     assert response.json()["status"] == "completed"
 
 
-def test_meta_da_secao_2_3_vai_para_os_headers(client, executor, financeiro):
-    executor.result = _resultado()
+def test_meta_da_secao_2_3_vai_para_os_headers(client, job_queue, financeiro):
+    job_queue.default_result = _resultado()
 
     response = client.post("/v1/query?format=csv", json=PAYLOAD, headers=financeiro)
 
@@ -108,25 +108,24 @@ def test_format_no_corpo_e_rejeitado(client, financeiro):
 # --- o formato não faz parte da consulta --------------------------------------------------
 
 
-def test_csv_e_json_compartilham_query_id_e_cache(client, executor, cache, financeiro):
+def test_csv_e_json_compartilham_query_id(client, job_queue, financeiro):
     """O ponto central do desenho: `format` não entra no `QueryRequest`, então a mesma
-    consulta em JSON e em CSV tem um `query_id` só, executa uma vez e usa a mesma
-    entrada de cache."""
-    executor.result = _resultado()
+    consulta em JSON e em CSV tem um `query_id` só e é enfileirada com o mesmo payload —
+    a deduplicação por `query_id` (e o cache, gravado pelo worker) decorrem disso."""
+    job_queue.default_result = _resultado()
 
     em_json = client.post("/v1/query", json=PAYLOAD, headers=financeiro)
     em_csv = client.post("/v1/query?format=csv", json=PAYLOAD, headers=financeiro)
 
     assert em_csv.headers["x-query-id"] == em_json.json()["query_id"]
-    assert len(executor.calls) == 1  # a segunda requisição veio do cache
-    assert cache.hits == 1
+    assert job_queue.calls[0][0].query_id == job_queue.calls[1][0].query_id
 
 
 # --- GET /v1/query ------------------------------------------------------------------------
 
 
-def test_get_com_parametros_planos(client, executor, financeiro):
-    executor.result = _resultado()
+def test_get_com_parametros_planos(client, job_queue, financeiro):
+    job_queue.default_result = _resultado()
 
     response = client.get(
         "/v1/query?schema=vendas&dimensions=sigla_uf&measures=valor_total&format=csv",
@@ -137,10 +136,10 @@ def test_get_com_parametros_planos(client, executor, financeiro):
     assert response.text == CSV_ESPERADO
 
 
-def test_get_com_query_json_tambem_aceita_format(client, executor, financeiro):
+def test_get_com_query_json_tambem_aceita_format(client, job_queue, financeiro):
     """"Se `query` estiver presente, os demais parâmetros são ignorados" vale para a
     consulta; `format` é transporte e continua valendo."""
-    executor.result = _resultado()
+    job_queue.default_result = _resultado()
     querystring = urlencode({"query": json.dumps(PAYLOAD), "format": "csv"})
 
     response = client.get(f"/v1/query?{querystring}", headers=financeiro)
@@ -152,19 +151,16 @@ def test_get_com_query_json_tambem_aceita_format(client, executor, financeiro):
 # --- caminho assíncrono -------------------------------------------------------------------
 
 
-def test_enfileiramento_responde_json_mesmo_pedindo_csv(client, executor, financeiro):
-    """`{query_id, status, poll_url}` não é tabela — o 202 sai em JSON sempre."""
-    executor.result = QueryResult.processing("q_9d31be")
-
+def test_enfileiramento_responde_json_mesmo_pedindo_csv(client, financeiro):
+    """`{query_id, status, poll_url}` não é tabela — o 202 sai em JSON sempre. Sem
+    worker, a janela inline expira e a submissão devolve `processing`."""
     response = client.post("/v1/query?format=csv", json=PAYLOAD, headers=financeiro)
 
     assert response.status_code == 202
     assert response.headers["content-type"].startswith("application/json")
-    assert response.json() == {
-        "query_id": "q_9d31be",
-        "status": "processing",
-        "poll_url": "/v1/query/q_9d31be",
-    }
+    body = response.json()
+    assert body["status"] == "processing"
+    assert body["poll_url"] == f"/v1/query/{body['query_id']}"
 
 
 async def test_status_em_processamento_responde_json(client, job_queue):

@@ -91,6 +91,80 @@ async def test_query_id_desconhecido_devolve_none(pool):
     assert await queue.get_status("q_nunca_existiu") is None
 
 
+async def test_wait_for_result_timeout_devolve_processing(pool):
+    """Sem worker consumindo a fila, a janela expira e a espera inline devolve
+    `processing` — a borda HTTP responde 202 + poll_url."""
+    queue = ArqJobQueue(pool)
+    request = _request()
+    await queue.enqueue(request, dataset_name="vendas_agregado_uf")
+
+    result = await queue.wait_for_result(request.query_id, timeout=0.2)
+
+    assert result.status is QueryStatus.PROCESSING
+    assert result.query_id == request.query_id
+
+
+async def test_wait_for_result_query_id_desconhecido_devolve_processing(pool):
+    queue = ArqJobQueue(pool)
+
+    result = await queue.wait_for_result("q_nunca_existiu", timeout=0.2)
+
+    assert result.status is QueryStatus.PROCESSING
+
+
+async def test_wait_for_result_completed_apos_worker_burst(pool):
+    request = _request()
+    expected_result = QueryResult.completed(
+        query_id=request.query_id,
+        columns=(Column(field="sigla_uf", type=DataType.STRING),),
+        rows=(("SP",),),
+        dataset_used="vendas_agregado_uf",
+    )
+
+    async def run_heavy_query(ctx: dict[str, Any], request_dict: dict, dataset_name: str) -> dict:
+        return result_to_dict(expected_result)
+
+    queue = ArqJobQueue(pool)
+    await queue.enqueue(request, dataset_name="vendas_agregado_uf")
+
+    worker = Worker(
+        functions=[func(run_heavy_query, name="run_heavy_query")],
+        redis_pool=pool,
+        burst=True,
+        poll_delay=0,
+    )
+    await worker.async_run()
+    await worker.close()
+
+    result = await queue.wait_for_result(request.query_id, timeout=5)
+
+    assert result == expected_result
+
+
+async def test_wait_for_result_failed_apos_worker_burst(pool):
+    request = _request()
+
+    async def run_heavy_query(ctx: dict[str, Any], request_dict: dict, dataset_name: str) -> dict:
+        raise RuntimeError("estourou o timeout do datasource")
+
+    queue = ArqJobQueue(pool)
+    await queue.enqueue(request, dataset_name="vendas_agregado_uf")
+
+    worker = Worker(
+        functions=[func(run_heavy_query, name="run_heavy_query")],
+        redis_pool=pool,
+        burst=True,
+        poll_delay=0,
+    )
+    await worker.async_run()
+    await worker.close()
+
+    result = await queue.wait_for_result(request.query_id, timeout=5)
+
+    assert result.status is QueryStatus.FAILED
+    assert "estourou o timeout" in result.error
+
+
 async def test_enfileirar_o_mesmo_query_id_duas_vezes_nao_duplica_o_job(pool):
     """`query_id` como `_job_id`: duas requisições idênticas (mesmo hash — seção 3)
     reaproveitam o job já na fila."""

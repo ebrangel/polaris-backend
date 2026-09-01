@@ -145,7 +145,7 @@ async def test_zero_dimensoes_agrega_o_indice_inteiro(es_client):
 async def test_timeout_real_vira_query_timeout_error(es_client):
     schema = eventos_schema()
     dataset = eventos_navegacao_es()
-    executor = ElasticsearchQueryExecutor(client=es_client, light_timeout_seconds=0.001)
+    executor = ElasticsearchQueryExecutor(client=es_client, timeout_seconds=0.001)
     request = QueryRequest(
         schema="eventos_navegacao", dimensions=("pais", "dispositivo"), measures=("duracao_media",)
     )

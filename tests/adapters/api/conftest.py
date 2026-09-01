@@ -57,7 +57,6 @@ def _build_client(catalog, executor, cache, job_queue, exporter) -> TestClient:
     execute_query = ExecuteQuery(
         catalog=catalog,
         resolve_dataset=ResolveDataset(),
-        executors=dict.fromkeys(_ALL_CONNECTION_REFS, executor),
         cache=cache,
         job_queue=job_queue,
     )

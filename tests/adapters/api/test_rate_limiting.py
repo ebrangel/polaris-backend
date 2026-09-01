@@ -10,28 +10,27 @@ from httpx import Response
 
 from adapters.api import create_app
 from application.use_cases import ExecuteQuery, ResolveDataset
-from fakes import InMemoryCacheGateway, InMemoryJobQueue, InMemoryRateLimiter, StubQueryExecutor
-
-_ALL_CONNECTION_REFS = (
-    "env:DW_VENDAS_PG_URL",
-    "env:DW_VENDAS_ORACLE_URL",
-    "env:ES_EVENTOS_URL",
-    "env:APP_ESTOQUE_URL",
-)
+from domain.models import QueryResult
+from fakes import InMemoryCacheGateway, InMemoryJobQueue, InMemoryRateLimiter
 
 
 def _client_with_request_limit(limit: int) -> tuple[TestClient, InMemoryRateLimiter]:
     catalog = catalog_fixture()
     limiter = InMemoryRateLimiter(limit=limit)
+    job_queue = InMemoryJobQueue()
+    # O job "conclui" dentro da janela inline, para as requisições permitidas voltarem
+    # 200 — o que este teste isola é o 429 do rate limiter, não o desfecho do job.
+    job_queue.default_result = QueryResult.completed(
+        query_id="q_ok", columns=(), rows=(), dataset_used="vendas_agregado_uf"
+    )
     execute_query = ExecuteQuery(
         catalog=catalog,
         resolve_dataset=ResolveDataset(),
-        executors=dict.fromkeys(_ALL_CONNECTION_REFS, StubQueryExecutor()),
         cache=InMemoryCacheGateway(),
-        job_queue=InMemoryJobQueue(),
+        job_queue=job_queue,
         request_rate_limiter=limiter,
     )
-    app = create_app(catalog=catalog, execute_query=execute_query, job_queue=InMemoryJobQueue())
+    app = create_app(catalog=catalog, execute_query=execute_query, job_queue=job_queue)
     return TestClient(app), limiter
 
 

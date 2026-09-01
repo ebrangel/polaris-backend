@@ -65,63 +65,51 @@ def test_load_settings_sem_env_obrigatoria_levanta_config_error(
 
 def test_load_settings_le_os_opcionais_quando_presentes(env_obrigatorio, monkeypatch):
     monkeypatch.setenv("GIT_SHA", "cafe1234")
-    monkeypatch.setenv("LIGHT_TIMEOUT_SECONDS", "2.5")
-    monkeypatch.setenv("HEAVY_TIMEOUT_SECONDS", "600")
-    monkeypatch.setenv("COST_THRESHOLD", "5000")
-    monkeypatch.setenv("HEURISTIC_COST_THRESHOLD", "15")
+    monkeypatch.setenv("QUERY_TIMEOUT_SECONDS", "600")
+    monkeypatch.setenv("INLINE_WAIT_SECONDS", "1.5")
+    monkeypatch.setenv("INLINE_WAIT_POLL_DELAY", "0.05")
     monkeypatch.setenv("CACHE_TTL_SECONDS", "60")
     monkeypatch.setenv("CACHE_MAX_ROWS", "5000")
     monkeypatch.setenv("CACHE_MAX_PAYLOAD_BYTES", "1048576")
     monkeypatch.setenv("DEFAULT_MAX_LIMIT", "20000")
-    monkeypatch.setenv("LIGHT_POOL_SIZE", "10")
-    monkeypatch.setenv("HEAVY_POOL_SIZE", "2")
+    monkeypatch.setenv("QUERY_POOL_SIZE", "4")
     monkeypatch.setenv("SLOW_QUERY_THRESHOLD_MS", "500")
     monkeypatch.setenv("REQUEST_RATE_LIMIT", "50")
     monkeypatch.setenv("REQUEST_RATE_LIMIT_WINDOW_SECONDS", "30")
-    monkeypatch.setenv("HEAVY_QUERY_RATE_LIMIT", "3")
-    monkeypatch.setenv("HEAVY_QUERY_RATE_LIMIT_WINDOW_SECONDS", "120")
-    monkeypatch.setenv("MAX_HEAVY_QUEUE_DEPTH", "10")
+    monkeypatch.setenv("MAX_QUEUE_DEPTH", "10")
     monkeypatch.setenv("LOG_LEVEL", "DEBUG")
 
     settings = load_settings()
 
     assert settings.git_sha == "cafe1234"
-    assert settings.light_timeout_seconds == 2.5
-    assert settings.heavy_timeout_seconds == 600.0
-    assert settings.cost_threshold == 5000.0
-    assert settings.heuristic_cost_threshold == 15.0
+    assert settings.query_timeout_seconds == 600.0
+    assert settings.inline_wait_seconds == 1.5
+    assert settings.inline_wait_poll_delay == 0.05
     assert settings.cache_ttl_seconds == 60
     assert settings.cache_max_rows == 5000
     assert settings.cache_max_payload_bytes == 1_048_576
     assert settings.default_max_limit == 20_000
-    assert settings.light_pool_size == 10
-    assert settings.heavy_pool_size == 2
+    assert settings.query_pool_size == 4
     assert settings.slow_query_threshold_ms == 500
     assert settings.request_rate_limit == 50
     assert settings.request_rate_limit_window_seconds == 30
-    assert settings.heavy_query_rate_limit == 3
-    assert settings.heavy_query_rate_limit_window_seconds == 120
-    assert settings.max_heavy_queue_depth == 10
+    assert settings.max_queue_depth == 10
     assert settings.log_level == "DEBUG"
 
 
 def test_load_settings_usa_defaults_dos_opcionais_ausentes(env_obrigatorio):
     settings = load_settings()
 
-    assert settings.light_timeout_seconds == 5.0
-    assert settings.heavy_timeout_seconds == 300.0
-    assert settings.cost_threshold == 10_000.0
-    assert settings.heuristic_cost_threshold == 30.0
+    assert settings.query_timeout_seconds == 300.0
+    assert settings.inline_wait_seconds == 2.0
+    assert settings.inline_wait_poll_delay == 0.1
     assert settings.cache_ttl_seconds == 3600
     assert settings.cache_max_rows == 100_000
     assert settings.cache_max_payload_bytes == 8 * 1024 * 1024
     assert settings.default_max_limit == 50_000
-    assert settings.light_pool_size == 20
-    assert settings.heavy_pool_size == 3
+    assert settings.query_pool_size == 10
     assert settings.slow_query_threshold_ms == 2000
     assert settings.request_rate_limit == 100
     assert settings.request_rate_limit_window_seconds == 60
-    assert settings.heavy_query_rate_limit == 5
-    assert settings.heavy_query_rate_limit_window_seconds == 60
-    assert settings.max_heavy_queue_depth == 100
+    assert settings.max_queue_depth == 100
     assert settings.log_level == "INFO"

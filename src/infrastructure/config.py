@@ -41,13 +41,12 @@ class Settings:
     redis_url: str
     internal_token: str
     git_sha: str = "unknown"
-    light_timeout_seconds: float = 5.0
-    heavy_timeout_seconds: float = 300.0
-    cost_threshold: float = 10_000.0
-    #: Limiar da heurística de custo (contagem de campos), usada quando o dialeto não
-    #: tem `EXPLAIN` coberto ou ele falha. Escala diferente de `cost_threshold` — ver
-    #: `SQLAlchemyQueryExecutor.__init__`.
-    heuristic_cost_threshold: float = 30.0
+    #: Timeout de uma consulta contra um datasource (aplicado pelo executor no worker).
+    query_timeout_seconds: float = 300.0
+    #: Quanto a API aguarda o job concluir antes de devolver 202 + poll_url.
+    inline_wait_seconds: float = 2.0
+    #: Intervalo com que a API consulta o Redis pelo resultado durante a espera inline.
+    inline_wait_poll_delay: float = 0.1
     cache_ttl_seconds: int = 3600
     #: Tetos do que vale a pena guardar no Redis: acima deles o resultado não é
     #: cacheado (a consulta seguinte executa de novo, e nada falha).
@@ -57,8 +56,8 @@ class Settings:
     #: consulta sem `limit` vira `SELECT` sem `LIMIT`, e o resultado inteiro é
     #: materializado em memória.
     default_max_limit: int = 50_000
-    light_pool_size: int = 20
-    heavy_pool_size: int = 3
+    #: Tamanho do pool de conexões por datasource (aberto pelo worker).
+    query_pool_size: int = 10
     # --- Export de consultas pesadas (seção 2.4a) -------------------------------------
     #: Diretório onde o worker grava os CSV e de onde a API os serve. **Os dois
     #: processos precisam enxergar o mesmo caminho** — mesmo host, ou volume
@@ -70,9 +69,7 @@ class Settings:
     slow_query_threshold_ms: int = 2000
     request_rate_limit: int = 100
     request_rate_limit_window_seconds: int = 60
-    heavy_query_rate_limit: int = 5
-    heavy_query_rate_limit_window_seconds: int = 60
-    max_heavy_queue_depth: int = 100
+    max_queue_depth: int = 100
     log_level: str = "INFO"
 
 
@@ -87,20 +84,16 @@ def load_settings() -> Settings:
         redis_url=_require_env("REDIS_URL"),
         internal_token=_require_env("INTERNAL_TOKEN"),
         git_sha=os.environ.get("GIT_SHA", "unknown"),
-        light_timeout_seconds=float(os.environ.get("LIGHT_TIMEOUT_SECONDS", "5.0")),
-        heavy_timeout_seconds=float(os.environ.get("HEAVY_TIMEOUT_SECONDS", "300.0")),
-        cost_threshold=float(os.environ.get("COST_THRESHOLD", "10000.0")),
-        heuristic_cost_threshold=float(
-            os.environ.get("HEURISTIC_COST_THRESHOLD", "30.0")
-        ),
+        query_timeout_seconds=float(os.environ.get("QUERY_TIMEOUT_SECONDS", "300.0")),
+        inline_wait_seconds=float(os.environ.get("INLINE_WAIT_SECONDS", "2.0")),
+        inline_wait_poll_delay=float(os.environ.get("INLINE_WAIT_POLL_DELAY", "0.1")),
         cache_ttl_seconds=int(os.environ.get("CACHE_TTL_SECONDS", "3600")),
         cache_max_rows=int(os.environ.get("CACHE_MAX_ROWS", "100000")),
         cache_max_payload_bytes=int(
             os.environ.get("CACHE_MAX_PAYLOAD_BYTES", str(8 * 1024 * 1024))
         ),
         default_max_limit=int(os.environ.get("DEFAULT_MAX_LIMIT", "50000")),
-        light_pool_size=int(os.environ.get("LIGHT_POOL_SIZE", "20")),
-        heavy_pool_size=int(os.environ.get("HEAVY_POOL_SIZE", "3")),
+        query_pool_size=int(os.environ.get("QUERY_POOL_SIZE", "10")),
         export_dir=os.environ.get("EXPORT_DIR", "exports"),
         export_ttl_seconds=int(os.environ.get("EXPORT_TTL_SECONDS", "86400")),
         slow_query_threshold_ms=int(os.environ.get("SLOW_QUERY_THRESHOLD_MS", "2000")),
@@ -108,10 +101,6 @@ def load_settings() -> Settings:
         request_rate_limit_window_seconds=int(
             os.environ.get("REQUEST_RATE_LIMIT_WINDOW_SECONDS", "60")
         ),
-        heavy_query_rate_limit=int(os.environ.get("HEAVY_QUERY_RATE_LIMIT", "5")),
-        heavy_query_rate_limit_window_seconds=int(
-            os.environ.get("HEAVY_QUERY_RATE_LIMIT_WINDOW_SECONDS", "60")
-        ),
-        max_heavy_queue_depth=int(os.environ.get("MAX_HEAVY_QUEUE_DEPTH", "100")),
+        max_queue_depth=int(os.environ.get("MAX_QUEUE_DEPTH", "100")),
         log_level=os.environ.get("LOG_LEVEL", "INFO"),
     )

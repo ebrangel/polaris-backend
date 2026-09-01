@@ -68,12 +68,12 @@ async def test_status_em_processamento_nao_traz_download_url(
     assert "download_url" not in body
 
 
-async def test_consulta_sincrona_nao_traz_download_url(
-    client_com_export, executor, financeiro
+async def test_resultado_inline_da_submissao_nao_traz_download_url(
+    client_com_export, job_queue, financeiro
 ):
-    """Export existe só para consulta que passou pela fila — o caminho síncrono não
-    consulta o exportador."""
-    executor.result = _resultado("q_8f2a1c")
+    """`download_url` só aparece em `GET /v1/query/{query_id}` — a resposta da submissão
+    (mesmo concluída dentro da janela inline) não consulta o exportador."""
+    job_queue.default_result = _resultado("q_8f2a1c")
 
     body = client_com_export.post(
         "/v1/query",
