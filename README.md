@@ -138,16 +138,45 @@ docker run -d --name polaris-redis -p 6379:6379 redis:7-alpine
 
 ### 3. Configurar o ambiente
 
+`infrastructure/config.py` — o único lugar do sistema que lê `os.environ` diretamente — carrega um
+`.env` do diretório de trabalho automaticamente, se existir. Copie o template e ajuste os valores:
+
+```bash
+cp .env.example .env
+```
+
+```dotenv
+# .env
+CATALOG_DB_URL=postgresql+psycopg://postgres:polaris@localhost:5432/postgres
+REDIS_URL=redis://localhost:6379/0
+INTERNAL_TOKEN=um-token-qualquer-para-dev
+
+# Um por `connection_ref` declarado no catálogo (formato `env:NOME`):
+```
+
+`INTERNAL_TOKEN` é só o valor esperado no header `X-Internal-Token` das rotas `/internal/*` — qualquer
+string serve para dev; para gerar um valor aleatório:
+
+```bash
+python3 -c "import secrets; print(secrets.token_hex(32))"
+```
+
+```dotenv
+APP_ESTOQUE_URL=postgresql+psycopg://postgres:polaris@localhost:5432/postgres
+DW_VENDAS_PG_URL=postgresql+psycopg://postgres:polaris@localhost:5432/postgres
+DW_VENDAS_ORACLE_URL=oracle+oracledb://user:pass@localhost:1521/?service_name=XEPDB1
+ES_EVENTOS_URL=http://localhost:9200
+```
+
+`.env` nunca é commitado (está no `.gitignore`) e nunca vence env vars já definidas no ambiente real
+— em produção/CI a orquestração define as variáveis diretamente, e o `.env` só preenche o que
+estiver faltando. Se preferir não usar o arquivo, `export` funciona do mesmo jeito:
+
 ```bash
 export CATALOG_DB_URL="postgresql+psycopg://postgres:polaris@localhost:5432/postgres"
 export REDIS_URL="redis://localhost:6379/0"
 export INTERNAL_TOKEN="um-token-qualquer-para-dev"
-
-# Um por `connection_ref` declarado no catálogo (formato `env:NOME`):
-export APP_ESTOQUE_URL="postgresql+psycopg://postgres:polaris@localhost:5432/postgres"
-export DW_VENDAS_PG_URL="postgresql+psycopg://postgres:polaris@localhost:5432/postgres"
-export DW_VENDAS_ORACLE_URL="oracle+oracledb://user:pass@localhost:1521/?service_name=XEPDB1"
-export ES_EVENTOS_URL="http://localhost:9200"
+# ...e os demais, iguais ao .env acima.
 ```
 
 > **Atenção:** o boot resolve **todos** os `connection_ref` dos schemas ativos no catálogo. Como
@@ -594,6 +623,7 @@ documentação como objetos de domínio, e `tests/application/test_catalog_codec
 ├── catalog/schemas/            # Catálogo versionado em YAML
 ├── docs/                       # Documentação de referência
 ├── scripts/publish_catalog.py  # Publicação incremental (chamado pelo CI)
+├── .env.example                # Template de variáveis de ambiente (copiar para .env)
 ├── main.py                     # Entry point (API ou worker, por PROCESS_ROLE)
 ├── src/
 │   ├── domain/                 # Entidades puras — models.py, errors.py

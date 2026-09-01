@@ -5,6 +5,8 @@ lê `os.environ` diretamente (o resto recebe configuração já resolvida).
 import os
 from dataclasses import dataclass
 
+from dotenv import load_dotenv
+
 
 class ConfigError(Exception):
     """Variável de ambiente obrigatória ausente ou `connection_ref` malformado."""
@@ -75,6 +77,11 @@ class Settings:
 
 
 def load_settings() -> Settings:
+    # `override=False` (padrão): variáveis já presentes no ambiente real vencem o
+    # `.env` — em produção/CI a orquestração define as env vars diretamente, e o
+    # arquivo não deve pisar nelas. Sem `.env` no working directory (caso normal em
+    # produção), a chamada é um no-op.
+    load_dotenv()
     return Settings(
         catalog_db_url=_require_env("CATALOG_DB_URL"),
         redis_url=_require_env("REDIS_URL"),

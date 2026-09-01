@@ -12,6 +12,7 @@ dependencies = [
     "elasticsearch[async]>=8.0",
     "arq>=0.26",
     "pyyaml>=6.0",
+    "python-dotenv>=1.2.2",
 ]
 
 [dependency-groups]
