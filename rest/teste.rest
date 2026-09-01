@@ -1,5 +1,16 @@
 GET http://localhost:8000/v1/catalog
 
+###
+GET http://localhost:8000/v1/catalog/estoque
+
+###
+GET http://localhost:8000/internal/observability
+x-internal-token: troque-por-um-token-secreto
+
+###
+POST http://localhost:8000/internal/cache/purge
+x-internal-token: troque-por-um-token-secreto
+
 
 ###
 # Toda consulta é enfileirada. A API aguarda o job por INLINE_WAIT_SECONDS (2s):
@@ -10,9 +21,12 @@ content-type: application/json
 
 {
     "schema": "estoque",
-    "dimensions": ["filial"],
+    "dimensions": ["filial","produto"],
     "measures": ["quantidade_disponivel"]
 }
+
+###
+GET http://localhost:8000/v1/query/q_deb229
 
 ###
 # Opção A — o mesmo JSON do POST, url-encoded (paridade total)

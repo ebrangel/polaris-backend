@@ -184,6 +184,35 @@ curl -s localhost:8000/internal/observability -H "X-Internal-Token: $INTERNAL_TO
 Os contadores de cache são acumulados no Redis (chaves `cache:hits` / `cache:misses`), então
 sobrevivem ao restart de uma réplica e são compartilhados entre todas.
 
+### Limpeza de cache
+
+Cada entrada de cache é gravada sob a chave `query:<schema>:<query_id>`. Isso permite forçar
+a limpeza pelo endpoint interno, tudo ou só um schema:
+
+```bash
+# só as consultas do schema 'vendas'
+curl -X POST "localhost:8000/internal/cache/purge?schema=vendas" \
+  -H "X-Internal-Token: $INTERNAL_TOKEN"
+# {"purged": 12, "schema": "vendas"}
+
+# o cache inteiro (sem ?schema=)
+curl -X POST localhost:8000/internal/cache/purge -H "X-Internal-Token: $INTERNAL_TOKEN"
+# {"purged": 40, "schema": null}
+```
+
+`purged` é quantas entradas foram removidas. Schema inexistente é no-op (`purged: 0`), não
+erro. Os contadores `cache:hits` / `cache:misses` **não** são zerados pela purga. Publicar uma
+nova versão de um schema (endpoint de publicação ou `redis-cli PUBLISH catalog:invalidate
+<schema>`) já dispara a limpeza do cache daquele schema automaticamente — o `query_id` embute
+o hash da requisição, não o do catálogo, então o cache não expiraria sozinho por conta da
+republicação.
+
+Ao re-submeter uma consulta idêntica logo após a purga, ela **re-executa** de fato: o
+`enqueue` descarta o resultado que o `arq` retinha do job anterior (`arq:result:<query_id>`,
+TTL `keep_result`), senão o job não rodaria de novo e a resposta voltaria com `cached=false`
+sem repovoar o cache. O `GET /v1/query/{query_id}` por id continua lendo o resultado do job
+no `arq` (não o `CacheGateway`), então ali `cached` reflete o job, não o cache.
+
 ### Consultas lentas
 
 Toda consulta que passa de `SLOW_QUERY_THRESHOLD_MS` gera um `WARNING`, tanto no caminho síncrono

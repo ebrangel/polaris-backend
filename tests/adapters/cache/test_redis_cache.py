@@ -177,6 +177,43 @@ async def test_chave_usa_o_prefixo_configurado(redis_client):
     assert raw is not None
 
 
+async def test_chave_carrega_o_schema_de_origem(redis_client):
+    """A chave é `QueryRequest.cache_key` (`<schema>:<query_id>`) sob o prefixo."""
+    cache = RedisCacheGateway(redis_client, key_prefix="test_ns:")
+    await cache.set("vendas:q_ns1", _resultado_da_secao_2_3("q_ns1"))
+
+    assert await redis_client.get("test_ns:vendas:q_ns1") is not None
+
+
+async def test_clear_por_schema_so_apaga_o_prefixo(redis_client):
+    cache = RedisCacheGateway(redis_client, key_prefix="test_clear_schema:")
+    await cache.set("vendas:q_a", _resultado_da_secao_2_3("q_a"))
+    await cache.set("vendas:q_b", _resultado_da_secao_2_3("q_b"))
+    await cache.set("rh:q_c", _resultado_da_secao_2_3("q_c"))
+
+    removed = await cache.clear("vendas")
+
+    assert removed == 2
+    assert await cache.get("vendas:q_a") is None
+    assert await cache.get("rh:q_c") is not None
+
+
+async def test_clear_sem_schema_apaga_todo_o_cache_mas_nao_os_contadores(redis_client):
+    cache = RedisCacheGateway(redis_client, key_prefix="test_clear_all:")
+    await cache.set("vendas:q_a", _resultado_da_secao_2_3("q_a"))
+    await cache.set("rh:q_b", _resultado_da_secao_2_3("q_b"))
+    await cache.get("vendas:q_a")  # incrementa cache:hits
+    hits_antes = (await cache.stats()).hits
+
+    removed = await cache.clear()
+
+    assert removed == 2
+    assert await cache.get("vendas:q_a") is None
+    # `cache:hits`/`cache:misses` não têm o prefixo `query:`/`test_clear_all:` — o
+    # `clear` não os toca (a chamada `get` acima soma 1 miss ao contador).
+    assert (await cache.stats()).hits == hits_antes
+
+
 async def test_stats_acompanha_hits_e_misses_reais(redis_client):
     """`cache:hits`/`cache:misses` são chaves fixas, compartilhadas por todo o
     processo (Marco 9) — os demais testes deste módulo também as incrementam, então a

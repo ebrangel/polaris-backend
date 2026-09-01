@@ -7,6 +7,7 @@ import asyncio
 import logging
 
 from arq.connections import ArqRedis
+from arq.constants import result_key_prefix
 from arq.jobs import Job, JobStatus, ResultNotFound
 
 from adapters.serialization import dict_to_result, request_to_dict
@@ -40,7 +41,19 @@ class ArqJobQueue:
         """Usa `query_id` como `_job_id`: duas requisições idênticas (mesmo hash da
         seção 3) reaproveitam o mesmo job — o `arq` não duplica um `_job_id` já na fila
         (`enqueue_job` devolve `None` nesse caso, que aqui é ignorado de propósito: o
-        `202` devolvido é sempre o mesmo, exista ou não job novo por trás)."""
+        `202` devolvido é sempre o mesmo, exista ou não job novo por trás).
+
+        Antes de enfileirar, descarta o **resultado retido** do arq (`arq:result:<id>`,
+        TTL `keep_result`, 1h por padrão) de uma execução anterior. Sem isso,
+        `enqueue_job` não re-executaria e `wait_for_result` devolveria aquele resultado
+        antigo — mascarando o `CacheGateway` quando ele foi purgado/invalidado nesse
+        intervalo (a consulta voltaria com `cached=false` e o cache nunca se
+        repovoaria). Chegar aqui já significa que o cache de resultados não tinha a
+        consulta; a deduplicação de requisições concorrentes continua valendo, porque
+        ela se dá pelo job em fila/execução (`arq:job:<id>` / in-progress), não pelo
+        resultado retido.
+        """
+        await self._pool.delete(f"{result_key_prefix}{request.query_id}")
         await self._pool.enqueue_job(
             self._function_name,
             request_to_dict(request),

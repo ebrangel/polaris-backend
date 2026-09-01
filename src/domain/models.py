@@ -608,6 +608,16 @@ class QueryRequest:
         """Identificador da consulta, no formato `q_8f2a1c` das seções 2.3 e 2.4."""
         return f"q_{self.fingerprint()[:6]}"
 
+    @property
+    def cache_key(self) -> str:
+        """Identidade da requisição no cache — o `query_id` prefixado pelo schema de
+        origem, para que a invalidação por schema seja um scan por prefixo.
+
+        O `query_id` sozinho continua sendo o identificador do job (`_job_id` do arq) e
+        o nome do arquivo de export; só a chave de cache carrega o schema.
+        """
+        return f"{self.schema}:{self.query_id}"
+
 
 # --------------------------------------------------------------------------------------
 # Consulta — resultado

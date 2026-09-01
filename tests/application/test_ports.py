@@ -42,7 +42,7 @@ PORT_METHODS = {
         ("get_active_version", "list_active_versions", "publish_new_version"),
     ),
     QueryExecutor: (StubQueryExecutor, ("execute",)),
-    CacheGateway: (InMemoryCacheGateway, ("get", "set", "delete", "stats")),
+    CacheGateway: (InMemoryCacheGateway, ("get", "set", "delete", "clear", "stats")),
     JobQueue: (InMemoryJobQueue, ("enqueue", "wait_for_result", "get_status", "depth")),
     DatasourceInspector: (StubDatasourceInspector, ("missing_fields",)),
     CatalogInvalidator: (InMemoryCatalogInvalidator, ("publish",)),
@@ -192,6 +192,31 @@ async def test_cache_gateway_delete_remove_a_entrada(sample_result):
     await cache.delete(sample_result.query_id)
 
     assert await cache.get(sample_result.query_id) is None
+
+
+async def test_cache_gateway_clear_por_schema_so_remove_o_prefixo(sample_result):
+    cache = InMemoryCacheGateway()
+    await cache.set("vendas:q_aaa111", sample_result)
+    await cache.set("vendas:q_bbb222", sample_result)
+    await cache.set("rh:q_ccc333", sample_result)
+
+    removed = await cache.clear("vendas")
+
+    assert removed == 2
+    assert await cache.get("vendas:q_aaa111") is None
+    assert await cache.get("rh:q_ccc333") == sample_result
+
+
+async def test_cache_gateway_clear_sem_schema_remove_tudo(sample_result):
+    cache = InMemoryCacheGateway()
+    await cache.set("vendas:q_aaa111", sample_result)
+    await cache.set("rh:q_ccc333", sample_result)
+
+    removed = await cache.clear()
+
+    assert removed == 2
+    assert await cache.get("vendas:q_aaa111") is None
+    assert await cache.get("rh:q_ccc333") is None
 
 
 async def test_cache_gateway_stats_acompanha_hits_e_misses(sample_result):

@@ -69,7 +69,7 @@ class RunQueuedQuery:
         if self._cache is None or result.status is not QueryStatus.COMPLETED:
             return
         try:
-            await self._cache.set(request.query_id, result, self._cache_ttl_seconds)
+            await self._cache.set(request.cache_key, result, self._cache_ttl_seconds)
         except Exception:
             logger.warning(
                 "falha ao gravar a consulta %s no cache", request.query_id, exc_info=True

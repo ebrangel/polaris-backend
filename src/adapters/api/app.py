@@ -20,6 +20,7 @@ from adapters.api.errors import (
     validation_error_handler,
 )
 from adapters.api.routers import admin as admin_router
+from adapters.api.routers import cache_admin as cache_admin_router
 from adapters.api.routers import catalog as catalog_router
 from adapters.api.routers import observability as observability_router
 from adapters.api.routers import query as query_router
@@ -29,6 +30,7 @@ from application.ports.result_exporter import ResultExporter
 from application.use_cases.execute_query import ExecuteQuery
 from application.use_cases.get_observability_snapshot import GetObservabilitySnapshot
 from application.use_cases.publish_catalog import PublishCatalog
+from application.use_cases.purge_cache import PurgeCache
 from domain.errors import DomainError
 from domain.models import Catalog
 
@@ -42,15 +44,18 @@ def create_app(
     publish_catalog: PublishCatalog | None = None,
     catalog_repository: CatalogRepository | None = None,
     get_observability_snapshot: GetObservabilitySnapshot | None = None,
+    purge_cache: PurgeCache | None = None,
     internal_token: str | None = None,
     include_admin: bool | None = None,
     include_observability: bool | None = None,
+    include_cache_admin: bool | None = None,
     lifespan: Callable[[FastAPI], AbstractAsyncContextManager[None]] | None = None,
 ) -> FastAPI:
     """`publish_catalog`/`catalog_repository`/`get_observability_snapshot`/
-    `internal_token` são opcionais e aditivos (Marcos 8/9): sem eles, `/internal/*`
-    simplesmente não é montado — os testes do contrato de `/v1/*` (Marco 6) continuam
-    chamando `create_app` sem conhecer publicação nem observabilidade.
+    `purge_cache`/`internal_token` são opcionais e aditivos (Marcos 8/9): sem eles,
+    `/internal/*` simplesmente não é montado — os testes do contrato de `/v1/*`
+    (Marco 6) continuam chamando `create_app` sem conhecer publicação, observabilidade
+    nem limpeza de cache.
 
     `lifespan` é onde `main.py` pluga o assinante do pub/sub (`listen_for_invalidation`,
     Marco 8) como uma task de fundo — este adapter não sabe nada sobre Redis, só
@@ -71,6 +76,8 @@ def create_app(
         include_admin = publish_catalog is not None and catalog_repository is not None
     if include_observability is None:
         include_observability = get_observability_snapshot is not None
+    if include_cache_admin is None:
+        include_cache_admin = purge_cache is not None
 
     app = FastAPI(
         title="API de consultas analíticas multi-banco",
@@ -91,6 +98,7 @@ def create_app(
     app.state.publish_catalog = publish_catalog
     app.state.catalog_repository = catalog_repository
     app.state.get_observability_snapshot = get_observability_snapshot
+    app.state.purge_cache = purge_cache
     app.state.internal_token = internal_token
 
     # Todo erro de domínio vira o envelope único da seção 2.5; `DomainError` é a base
@@ -108,4 +116,6 @@ def create_app(
         app.include_router(admin_router.router)
     if include_observability:
         app.include_router(observability_router.router)
+    if include_cache_admin:
+        app.include_router(cache_admin_router.router)
     return app

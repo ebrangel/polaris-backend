@@ -78,7 +78,7 @@ class ExecuteQuery:
             request, limit=schema.effective_limit(request.limit, self._default_max_limit)
         )
 
-        cached = await self._cache.get(request.query_id)
+        cached = await self._cache.get(request.cache_key)
         if cached is not None:
             return replace(cached, meta=replace(cached.meta, cached=True))
 

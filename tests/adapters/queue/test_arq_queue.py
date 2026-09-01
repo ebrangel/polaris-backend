@@ -240,3 +240,49 @@ async def test_ciclo_completo_ate_failed_via_worker_burst(pool):
     assert status is not None
     assert status.status is QueryStatus.FAILED
     assert "estourou o timeout" in status.error
+
+
+async def test_enqueue_apos_job_concluido_descarta_o_resultado_retido_e_re_executa(pool):
+    """Depois que um job idêntico já concluiu (resultado retido pelo arq, `keep_result`),
+    um novo `enqueue` do mesmo `query_id` precisa re-executar — senão `wait_for_result`
+    devolveria o resultado antigo, mascarando um `CacheGateway` que foi purgado nesse
+    meio tempo (a consulta voltaria como `cached=false` e o cache nunca se repovoaria)."""
+    request = _request()
+    calls: list[int] = []
+
+    async def run_heavy_query(ctx: dict[str, Any], request_dict: dict, dataset_name: str) -> dict:
+        calls.append(1)
+        return result_to_dict(
+            QueryResult.completed(
+                query_id=request.query_id,
+                columns=(Column(field="sigla_uf", type=DataType.STRING),),
+                rows=(("SP",),),
+                dataset_used="vendas_agregado_uf",
+            )
+        )
+
+    def _worker() -> Worker:
+        return Worker(
+            functions=[func(run_heavy_query, name="run_heavy_query")],
+            redis_pool=pool,
+            burst=True,
+            poll_delay=0,
+        )
+
+    queue = ArqJobQueue(pool)
+
+    await queue.enqueue(request, dataset_name="vendas_agregado_uf")
+    w1 = _worker()
+    await w1.async_run()
+    await w1.close()
+    assert calls == [1]
+    assert await queue.get_status(request.query_id) is not None  # resultado retido
+
+    # Mesmo `query_id`, cache purgado: tem de virar um job novo, não devolver o antigo.
+    await queue.enqueue(request, dataset_name="vendas_agregado_uf")
+    assert await queue.depth() == 1
+
+    w2 = _worker()
+    await w2.async_run()
+    await w2.close()
+    assert calls == [1, 1]  # re-executou de fato

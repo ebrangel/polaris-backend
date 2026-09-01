@@ -7,6 +7,7 @@ from application.use_cases.get_observability_snapshot import (
 )
 from application.use_cases.load_catalog import LoadCatalog
 from application.use_cases.publish_catalog import PublishCatalog, PublishOutcome
+from application.use_cases.purge_cache import PurgeCache
 from application.use_cases.resolve_dataset import ResolveDataset
 from application.use_cases.run_queued_query import RunQueuedQuery
 
@@ -17,6 +18,7 @@ __all__ = [
     "ObservabilitySnapshot",
     "PublishCatalog",
     "PublishOutcome",
+    "PurgeCache",
     "ResolveDataset",
     "RunQueuedQuery",
 ]

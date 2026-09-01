@@ -17,6 +17,7 @@ from application.ports.result_exporter import ResultExporter
 from application.use_cases.execute_query import ExecuteQuery
 from application.use_cases.get_observability_snapshot import GetObservabilitySnapshot
 from application.use_cases.publish_catalog import PublishCatalog
+from application.use_cases.purge_cache import PurgeCache
 from domain.models import Catalog
 
 
@@ -54,6 +55,10 @@ def get_catalog_repository(request: Request) -> CatalogRepository:
 
 def get_observability_snapshot_use_case(request: Request) -> GetObservabilitySnapshot:
     return request.app.state.get_observability_snapshot
+
+
+def get_purge_cache(request: Request) -> PurgeCache:
+    return request.app.state.purge_cache
 
 
 def require_internal_token(
@@ -132,3 +137,4 @@ CatalogRepositoryDep = Annotated[CatalogRepository, Depends(get_catalog_reposito
 ObservabilitySnapshotDep = Annotated[
     GetObservabilitySnapshot, Depends(get_observability_snapshot_use_case)
 ]
+PurgeCacheDep = Annotated[PurgeCache, Depends(get_purge_cache)]

@@ -1,7 +1,9 @@
 """`RedisCacheGateway` — implementa `CacheGateway` (Marco 2) sobre `redis.asyncio`.
 
-A chave é sempre `QueryRequest.query_id` (seção 3); aqui só se soma um prefixo, para não
-colidir com o namespace `arq:*` que a fila (`ArqJobQueue`) usa no mesmo Redis.
+A chave é `QueryRequest.cache_key` (`<schema>:<query_id>`); aqui só se soma o prefixo
+`query:`, tanto para não colidir com o namespace `arq:*` da fila (`ArqJobQueue`) e o
+`ratelimit:request:*` do rate limiter no mesmo Redis, quanto para que `clear(schema)`
+seja um `SCAN MATCH query:<schema>:*`.
 """
 
 import json
@@ -95,6 +97,28 @@ class RedisCacheGateway:
 
     async def delete(self, key: str) -> None:
         await self._client.delete(self._redis_key(key))
+
+    async def clear(self, schema: str | None = None) -> int:
+        """Varre por padrão e apaga em lotes — não há registro de chaves para consultar.
+
+        `cache:hits`/`cache:misses` não têm o prefixo `query:`, então nunca casam; o
+        mesmo vale para `arq:*` e `ratelimit:request:*` no mesmo Redis.
+        """
+        match = (
+            f"{self._key_prefix}{schema}:*"
+            if schema is not None
+            else f"{self._key_prefix}*"
+        )
+        removed = 0
+        batch: list[str] = []
+        async for redis_key in self._client.scan_iter(match=match, count=500):
+            batch.append(redis_key)
+            if len(batch) >= 500:
+                removed += await self._client.delete(*batch)
+                batch.clear()
+        if batch:
+            removed += await self._client.delete(*batch)
+        return removed
 
     async def stats(self) -> CacheStats:
         hits, misses = await self._client.mget(_HITS_KEY, _MISSES_KEY)

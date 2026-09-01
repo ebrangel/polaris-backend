@@ -110,6 +110,17 @@ class InMemoryCacheGateway:
     async def delete(self, key: str) -> None:
         self._store.pop(key, None)
 
+    async def clear(self, schema: str | None = None) -> int:
+        prefix = None if schema is None else f"{schema}:"
+        doomed = [
+            key
+            for key in self._store
+            if prefix is None or key.startswith(prefix)
+        ]
+        for key in doomed:
+            del self._store[key]
+        return len(doomed)
+
     async def stats(self) -> CacheStats:
         return CacheStats(hits=self.hits, misses=self.misses)
 

@@ -141,7 +141,7 @@ async def test_toda_consulta_enfileira_e_aguarda_inline():
     assert result.status is QueryStatus.PROCESSING
     assert result.query_id == executada.query_id
     assert job_queue.calls == [(executada, "vendas_agregado_uf")]
-    assert await cache.get(executada.query_id) is None  # a API não grava no cache
+    assert await cache.get(executada.cache_key) is None  # a API não grava no cache
 
 
 async def test_resultado_inline_quando_o_job_conclui_no_tempo():
@@ -184,7 +184,7 @@ async def test_job_que_falhou_no_tempo_devolve_failed():
     result = await execute(request, roles=["financeiro"], client_id="cliente-1")
 
     assert result.status is QueryStatus.FAILED
-    assert await cache.get(executada.query_id) is None
+    assert await cache.get(executada.cache_key) is None
 
 
 # --- Cache pelo query_id (o worker é quem grava; aqui só a leitura) ---------------------
@@ -199,7 +199,7 @@ async def test_cache_hit_curto_circuita_sem_enfileirar():
     )
     request = QueryRequest(schema="vendas", dimensions=("sigla_uf",), measures=("valor_total",))
     cached = completed_for(request, schema)
-    await cache.set(cached.query_id, cached)
+    await cache.set(como_executada(request, schema).cache_key, cached)
 
     result = await execute(request, roles=["financeiro"], client_id="cliente-1")
 

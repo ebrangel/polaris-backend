@@ -129,7 +129,7 @@ async def test_grava_no_cache_quando_completed():
 
     result = await run(request, dataset_name="vendas_agregado_uf")
 
-    assert await cache.get(request.query_id) == result
+    assert await cache.get(request.cache_key) == result
 
 
 async def test_nao_grava_no_cache_quando_failed():
@@ -144,7 +144,7 @@ async def test_nao_grava_no_cache_quando_failed():
 
     await run(request, dataset_name="vendas_agregado_uf")
 
-    assert await cache.get(request.query_id) is None
+    assert await cache.get(request.cache_key) is None
 
 
 async def test_sem_cache_configurado_nao_grava():

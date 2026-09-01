@@ -42,6 +42,7 @@ from application.use_cases import (
     GetObservabilitySnapshot,
     LoadCatalog,
     PublishCatalog,
+    PurgeCache,
     ResolveDataset,
     RunQueuedQuery,
 )
@@ -206,11 +207,18 @@ def _build_lifespan(
         app.state.get_observability_snapshot = GetObservabilitySnapshot(
             cache=cache, job_queue=job_queue
         )
+        app.state.purge_cache = PurgeCache(cache=cache)
 
         load_catalog = LoadCatalog(context.catalog_repository)
 
         async def on_invalidate(schema_name: str) -> None:
+            # Uma nova versão do schema pode mudar mapping/joins/medidas — o resultado
+            # em cache daquele schema deixa de ser confiável. Recarrega o catálogo em
+            # memória e derruba o cache do schema republicado (o `query_id` embute o
+            # hash da requisição, não o do catálogo, então o cache não expiraria
+            # sozinho por conta da publicação).
             app.state.catalog = await load_catalog()
+            await cache.clear(schema_name)
 
         task = asyncio.create_task(listen_for_invalidation(pubsub_client, on_invalidate))
         try:
@@ -240,6 +248,7 @@ def create_application() -> FastAPI:
         internal_token=settings.internal_token,
         include_admin=True,
         include_observability=True,
+        include_cache_admin=True,
         lifespan=_build_lifespan(settings),
     )
 

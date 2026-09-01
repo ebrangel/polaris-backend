@@ -292,6 +292,13 @@ def test_query_id_tem_o_formato_do_contrato():
     assert all(c in "0123456789abcdef" for c in query_id[2:])
 
 
+def test_cache_key_prefixa_o_query_id_pelo_schema():
+    request = request_from_payload(PAYLOAD_SECAO_2_2)
+
+    assert request.cache_key == f"{request.schema}:{request.query_id}"
+    assert request.cache_key.startswith(f"{request.schema}:q_")
+
+
 def test_fingerprint_e_deterministico():
     assert (
         request_from_payload(PAYLOAD_SECAO_2_2).fingerprint()

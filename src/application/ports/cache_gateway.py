@@ -1,7 +1,8 @@
 """Port de cache de resultados (Redis, seção 3: "`query_id` ... usado como chave de cache").
 
-A chave é sempre `QueryRequest.query_id`, já implementado no domínio (Marco 1) — este
-port não conhece nada sobre como a chave é formada, só recebe `str`.
+A chave é `QueryRequest.cache_key` (`<schema>:<query_id>`), montada no domínio (Marco 1)
+— este port não conhece nada sobre como a chave é formada, só recebe `str`. O schema no
+prefixo é o que permite `clear(schema)` invalidar um schema inteiro de uma vez.
 """
 
 from dataclasses import dataclass
@@ -38,6 +39,15 @@ class CacheGateway(Protocol):
 
     async def delete(self, key: str) -> None:
         """Remove uma entrada do cache (ex: invalidação após publicação de catálogo)."""
+        ...
+
+    async def clear(self, schema: str | None = None) -> int:
+        """Remove entradas do cache em lote e devolve quantas foram removidas.
+
+        `schema=None` limpa o cache inteiro; um `schema` limpa só as entradas cuja
+        chave começa com aquele schema (ver `QueryRequest.cache_key`). Os contadores
+        de acerto/erro (`stats`, Marco 9) não são afetados.
+        """
         ...
 
     async def stats(self) -> CacheStats:
