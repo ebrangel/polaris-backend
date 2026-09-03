@@ -7,6 +7,7 @@ negócio vive aqui: o router traduz HTTP, o `ExecuteQuery` decide.
 """
 
 import json
+from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -30,8 +31,8 @@ from adapters.api.errors import (
     problem_response,
 )
 from adapters.api.query_params import parse_flat_params, schema_name_from_params
-from adapters.api.schemas import QueryRequestModel, present_result
-from application.ports.result_exporter import ExportMetadata, ResultExporter
+from adapters.api.schemas import QueryRequestModel, json_envelope, present_result
+from application.ports.result_exporter import ExportKind, ExportMetadata, ResultExporter
 from domain.models import QueryRequest, QueryResult, QueryStatus
 
 router = APIRouter(prefix="/v1/query", tags=["query"])
@@ -115,6 +116,50 @@ async def _file_response(
     )
 
 
+async def _json_stream_response(
+    exporter: ResultExporter,
+    result: QueryResult,
+    export: ExportMetadata | None,
+) -> Response:
+    """Corpo da seção 2.3 costurado a partir do arquivo `.jsonl` do worker.
+
+    O arquivo já guarda uma lista JSON por linha, exatamente no formato que `rows` espera;
+    só faltam as vírgulas entre elas e o envelope em volta. Assim a API responde um
+    resultado de qualquer tamanho sem nunca tê-lo inteiro em memória — que é o caso que
+    antes não existia, porque o Redis recusava o payload e não sobrava de onde responder.
+    """
+    try:
+        source = await exporter.open(result.query_id, ExportKind.JSONL)
+    except FileNotFoundError:
+        # Corrida contra a varredura de expirados, entre o `stat()` e o `open()`.
+        return _export_not_found(result.query_id)
+
+    head, tail = json_envelope(result, export=export)
+
+    async def body() -> AsyncIterator[bytes]:
+        yield head
+        pending = b""
+        first = True
+        async for block in source:
+            pending += block
+            # O bloco de 64 KiB corta no meio de uma linha; só o que está antes do último
+            # `\n` é seguro emitir. O resto espera o próximo bloco.
+            cut = pending.rfind(b"\n")
+            if cut == -1:
+                continue
+            chunk, pending = pending[:cut], pending[cut + 1 :]
+            for line in chunk.split(b"\n"):
+                if not line:
+                    continue
+                yield line if first else b"," + line
+                first = False
+        if pending.strip():
+            yield pending.strip() if first else b"," + pending.strip()
+        yield tail
+
+    return StreamingResponse(body(), status_code=200, media_type="application/json")
+
+
 async def _completed_response(
     result: QueryResult,
     output_format: OutputFormat,
@@ -125,18 +170,30 @@ async def _completed_response(
     """Corpo da seção 2.3 no formato negociado (seção 2.3a) — o **único** ponto do
     caminho da consulta em que o formato de saída importa.
 
-    Havendo arquivo gravado pelo worker, o CSV sai dele em vez de ser renderizado de
-    novo: mesmos bytes, sem o custo de reserializar, e o caminho vale para resultado de
-    qualquer tamanho. Sem arquivo — toda consulta síncrona, que nunca passou pela fila —
-    renderiza do resultado em memória, como antes.
+    Três origens possíveis, nesta ordem de preferência:
+
+    1. **Arquivo do worker** — CSV vem do `.csv`, JSON vem do `.jsonl`. Mesmos bytes que
+       foram gravados enquanto o cursor era lido, sem reserializar, e sem teto de tamanho.
+    2. **Resultado em memória** — o acerto de cache, que já traz as linhas e é o caminho
+       mais rápido para os resultados pequenos, que são os que se repetem.
+    3. Se o resultado não tem linhas em memória **nem** arquivo (o export expirou, ou o
+       servidor não tem export configurado), sai o descritor com `rows: []` — que é
+       honesto: o `meta` continua verdadeiro e `total_rows` diz quantas linhas existiam.
     """
     if output_format is not OutputFormat.CSV:
+        if exporter is not None and result.rows is None:
+            return await _json_stream_response(exporter, result, export)
         return JSONResponse(
             status_code=200, content=present_result(result, export=export)
         )
 
     if exporter is not None and export is not None:
         return await _file_response(exporter, export, headers=csv_headers(result))
+
+    if result.rows is None:
+        # CSV sem arquivo e sem linhas em memória: não há corpo a produzir, e devolver um
+        # CSV só com cabeçalho seria mentir sobre um resultado que tem linhas.
+        return _export_not_found(result.query_id)
 
     return StreamingResponse(
         csv_lines(result),
@@ -146,7 +203,11 @@ async def _completed_response(
     )
 
 
-async def _response_for(result: QueryResult, output_format: OutputFormat) -> Response:
+async def _response_for(
+    result: QueryResult,
+    output_format: OutputFormat,
+    result_exporter: ResultExporter | None,
+) -> Response:
     """202 para consulta enfileirada (seção 2.4); 200 para resultado pronto (2.3).
 
     A resposta de enfileiramento (e a de falha) sai **sempre em JSON**, qualquer que
@@ -155,15 +216,25 @@ async def _response_for(result: QueryResult, output_format: OutputFormat) -> Res
     justamente o caso de uso do formato; o cliente enfileira, acompanha o status em
     JSON e baixa o CSV em `GET /v1/query/{query_id}?format=csv`.
 
-    Não consulta o exportador: um resultado que chega por aqui foi executado agora ou
-    veio do cache, nunca do worker — export existe só para consulta que passou pela
-    fila, e é em `GET /v1/query/{query_id}` que ele aparece.
+    **Consulta o exportador** — o que não acontecia antes do Marco 12, quando a premissa
+    era "um resultado que chega por aqui nunca vem do worker". Com o caminho único de
+    execução essa premissa caiu: toda consulta passa pela fila, e um resultado que
+    concluiu dentro de `INLINE_WAIT_SECONDS` vem do worker com `rows=None`. Sem olhar o
+    arquivo aqui, a resposta do `POST` sairia sem linhas.
     """
     if result.status is QueryStatus.PROCESSING:
         return JSONResponse(status_code=202, content=present_result(result))
     if result.status is QueryStatus.FAILED:
         return JSONResponse(status_code=200, content=present_result(result))
-    return await _completed_response(result, output_format)
+
+    export = (
+        None
+        if result_exporter is None or result.rows is not None
+        else await result_exporter.stat(result.query_id)
+    )
+    return await _completed_response(
+        result, output_format, exporter=result_exporter, export=export
+    )
 
 
 async def _run(
@@ -172,9 +243,10 @@ async def _run(
     roles: RolesDep,
     client_id: ClientIdDep,
     output_format: OutputFormat,
+    result_exporter: ResultExporter | None,
 ) -> Response:
     result = await execute_query(domain_request, roles=roles, client_id=client_id)
-    return await _response_for(result, output_format)
+    return await _response_for(result, output_format, result_exporter)
 
 
 @router.post("")
@@ -184,11 +256,14 @@ async def post_query(
     roles: RolesDep,
     client_id: ClientIdDep,
     output_format: OutputFormatDep,
+    result_exporter: ResultExporterDep,
 ) -> Response:
     """O formato de saída vem de `?format=`/`Accept`, e não do corpo: o corpo continua
     sendo exatamente `QueryRequestModel` (com `extra="forbid"`), o que garante que
     formato nenhum vaze para dentro do `QueryRequest` e do `query_id`."""
-    return await _run(body.to_domain(), execute_query, roles, client_id, output_format)
+    return await _run(
+        body.to_domain(), execute_query, roles, client_id, output_format, result_exporter
+    )
 
 
 @router.get("")
@@ -199,6 +274,7 @@ async def get_query(
     roles: RolesDep,
     client_id: ClientIdDep,
     output_format: OutputFormatDep,
+    result_exporter: ResultExporterDep,
 ) -> Response:
     """Recebe o `Request` cru: `filter[campo][operador]` usa chaves dinâmicas, que o
     FastAPI não consegue declarar como parâmetros (limitação anotada na seção 2.2a).
@@ -220,7 +296,9 @@ async def get_query(
         schema = catalog.get_schema(schema_name_from_params(params))
         model = parse_flat_params(params, schema)
 
-    return await _run(model.to_domain(), execute_query, roles, client_id, output_format)
+    return await _run(
+        model.to_domain(), execute_query, roles, client_id, output_format, result_exporter
+    )
 
 
 @router.get("/{query_id}/download")
@@ -255,8 +333,15 @@ async def get_query_status(
 
     Concluída, a resposta JSON ganha `download_url`/`download_expires_at` quando o
     worker deixou um arquivo para trás; com `?format=csv`, o próprio arquivo é servido.
+
+    O `arq` retém o resultado de um job por `keep_result` (1h por padrão), bem menos que o
+    TTL do export. Passado esse prazo a fila não conhece mais a consulta, e é o
+    `.meta.json` do artefato que responde — antes do Marco 12 a resposta virava `404`
+    enquanto o arquivo ainda estava lá, baixável, na rota ao lado.
     """
     result = await job_queue.get_status(query_id)
+    if result is None and result_exporter is not None:
+        result = await result_exporter.read_result(query_id)
     if result is None:
         return problem_response(
             type_=UNKNOWN_QUERY_TYPE,

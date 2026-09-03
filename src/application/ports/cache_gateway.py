@@ -8,7 +8,8 @@ prefixo é o que permite `clear(schema)` invalidar um schema inteiro de uma vez.
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from domain.models import QueryResult
+from application.ports.row_sink import RowSink
+from domain.models import Column, QueryResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,12 +29,26 @@ class CacheGateway(Protocol):
         """Resultado em cache para a chave, ou `None` se ausente ou expirado."""
         ...
 
-    async def set(self, key: str, result: QueryResult, ttl_seconds: int | None = None) -> None:
-        """Grava o resultado em cache.
+    async def open_writer(
+        self,
+        key: str,
+        columns: tuple[Column, ...],
+        query_id: str,
+        dataset_used: str,
+        ttl_seconds: int | None = None,
+    ) -> RowSink:
+        """Abre um destino de escrita para o resultado desta chave.
 
-        Só resultados com `status=completed` são cacheáveis — resultados `processing`
-        ou `failed` não têm sentido como entrada de cache; quem chama este port garante
-        essa condição antes de chamar `set`.
+        Substitui o antigo `set(key, result)`: gravar exigia o `QueryResult` inteiro em
+        memória, que é justamente o que o Marco 12 eliminou. O sink acumula os blocos e
+        só materializa a entrada no `close`, respeitando os tetos do adapter.
+
+        **Passar do teto não é erro.** O sink desiste em silêncio (com log) e a consulta
+        seguinte simplesmente executa de novo — o port promete gravar o que couber. Só
+        resultados concluídos chegam aqui; quem chama garante isso.
+
+        `query_id` e `dataset_used` entram porque a entrada de cache guarda o
+        `QueryResult` inteiro da seção 2.3, e não só as linhas.
         """
         ...
 

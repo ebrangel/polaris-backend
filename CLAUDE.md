@@ -31,8 +31,9 @@ src/
       publish_catalog.py
     ports/
       catalog_repository.py   # interface: get_active_version, publish_new_version
-      query_executor.py       # interface: execute(dataset, query) -> QueryResult
-      cache_gateway.py         # interface: get, set
+      query_executor.py       # interface: execute(dataset, query, columns, sink) -> StreamedResult
+      row_sink.py              # interface: write, close, abort — destino das linhas
+      cache_gateway.py         # interface: get, open_writer
       job_queue.py             # interface: enqueue, get_status
 
   adapters/             # Implementações concretas dos ports
@@ -89,7 +90,7 @@ chamadas com `await`. Rotas FastAPI são `async def` e chamam os use cases assí
 - A **chave de cache** é `QueryRequest.cache_key` = `<schema>:<query_id>` (não o `query_id` sozinho): o prefixo de schema é o que deixa `CacheGateway.clear(schema)` invalidar um schema inteiro num scan por prefixo. `RedisCacheGateway` ainda soma o prefixo `query:` sobre isso (para não colidir com `arq:*`/`ratelimit:request:*` no mesmo Redis). `POST /internal/cache/purge?schema=` (use case `PurgeCache`) força a limpeza — tudo, ou só um schema; a publicação de catálogo também dispara `clear(schema)` pelo mesmo pub/sub que recarrega o catálogo em memória.
 - `ArqJobQueue.enqueue` **descarta o resultado retido do arq** (`arq:result:<query_id>`, TTL `keep_result`, 1h) antes de enfileirar. Sem isso, uma consulta re-submetida depois de um purge/invalidação do cache não re-executaria (o `arq` deduplicaria contra o resultado retido) e voltaria com `cached=false`, sem nunca repovoar o `CacheGateway`. Chegar em `enqueue` já significa cache miss; a deduplicação de requisições concorrentes continua, pois se dá pelo job em fila/execução, não pelo resultado retido.
 - Toda consulta passa pela fila; não há caminho síncrono nem classificação leve/pesada. `ExecuteQuery` valida, autoriza, aplica o teto de `limit`, lê o cache, resolve o dataset (só para nomear o job), checa o backpressure de fila (`MAX_QUEUE_DEPTH` → `429`), enfileira e aguarda o resultado por `INLINE_WAIT_SECONDS` via `arq.jobs.Job(...).result(timeout=...)`. Só o processo worker abre engine/cliente de datasource para executar consulta.
-- Quem executa a consulta, materializa o resultado e **grava no cache** é o **worker** (`RunQueuedQuery`) — é o único escritor do `CacheGateway`; a API só lê o cache. Todo job concluído também grava um CSV via o port `ResultExporter`, e a API entrega o arquivo pronto em `GET /v1/query/{query_id}/download`. O export é gerado para todo job, e não só para quem pediu CSV — o `arq` deduplica por `query_id`, então condicionar o arquivo à intenção do cliente perderia a intenção da segunda de duas requisições idênticas.
+- Quem executa a consulta e **grava no cache** é o **worker** (`RunQueuedQuery`) — é o único escritor do `CacheGateway`; a API só lê o cache. O worker não materializa o resultado: lê o cursor em blocos e empurra cada bloco, na mesma passada, para o cache e para os artefatos de export (Marco 12). A API entrega o arquivo pronto em `GET /v1/query/{query_id}/download` e transmite o corpo JSON a partir do `.jsonl`. O export é gerado para todo job, e não só para quem pediu CSV — o `arq` deduplica por `query_id`, então condicionar o arquivo à intenção do cliente perderia a intenção da segunda de duas requisições idênticas.
 
 ## Plano de execução sugerido (marcos)
 
@@ -147,16 +148,29 @@ Trabalhar um marco por vez; cada um deve ser testável e revisável isoladamente
 - Nada muda em `domain/`, `application/` nem nos executores: `QueryResult` já é `columns` + `rows`. O único ponto de decisão por formato é `_completed_response()` em `adapters/api/routers/query.py` — se um marco futuro precisar tocar `execute_query.py` para acrescentar um formato, o desenho foi violado
 - `202`/`processing`, `failed` e todos os erros da seção 2.5 continuam em JSON, qualquer que seja o formato pedido
 - O `meta` da seção 2.3 sai em headers `X-*` na resposta CSV; `Column.format` (`"currency"`) é dica de apresentação e não é aplicado — o CSV leva o valor cru
-- **Ainda não é streaming**: as linhas são geradas sob demanda, mas o executor materializa o resultado inteiro. O `csv_stream` da seção 2.6 exige um port de execução por streaming, com desvio de cache e de fila — marco próprio
+- **Superado pelo Marco 12**: o executor materializava o resultado inteiro. Hoje o cursor é lido em blocos e a resposta sai de um artefato já gravado; `_completed_response()` continua sendo o único ponto de decisão por formato
 
 ### Marco 11 — Export de consulta pesada (seção 2.4a do contrato)
-- Port `ResultExporter` (`export`/`stat`/`open`/`purge_expired`) + `LocalFileResultExporter`: um arquivo `<EXPORT_DIR>/<query_id>.csv` por job concluído, escrito pelo worker e servido pela API
-- **O port recebe `QueryResult`, não linhas de CSV já formatadas.** Quem chama é `RunQueuedQuery`, em `application/`, que não pode importar `adapters/` — e CSV é formato, assunto de adapter. Por isso o port é um *exportador* (formata e persiste), e não um *armazenamento*
+- Port `ResultExporter` + `LocalFileResultExporter`: artefatos em `<EXPORT_DIR>/<query_id>.*` por job concluído, escritos pelo worker e servidos pela API (no Marco 12 o port passou a `open_writer`/`stat`/`read_result`/`open`/`purge_expired`, e o job passou a gravar três arquivos)
+- **O port recebe domínio, não bytes já formatados.** Quem chama é `RunQueuedQuery`, em `application/`, que não pode importar `adapters/` — e CSV/JSON são formato, assunto de adapter. Por isso o port é um *exportador* (formata e persiste), e não um *armazenamento*
 - `adapters/csv_format.py` guarda o escritor de CSV compartilhado entre a API e o worker, pelo mesmo motivo de `adapters/serialization.py` já ser compartilhado entre cache e fila: um adapter de fila não pode depender de um adapter de HTTP
 - `download_url`/`download_expires_at` são transporte, montados pelo router a partir do `ExportMetadata` — como o `poll_url`, não existem no `QueryResult` do domínio
 - TTL autoritativo na **leitura** (`stat()` recusa vencido na hora), com o cron do worker cuidando só do espaço em disco. `open()` abre o descritor antes de devolver o gerador, para que a varredura não trunque download em andamento
 - Falha de export não derruba o job: o resultado já foi calculado e volta pela fila do mesmo jeito
 - Limitação conhecida: com adapter de filesystem, API e worker precisam do mesmo `EXPORT_DIR`. Um adapter de S3 entra sem mudar o contrato HTTP — a URL de download continua sendo a da própria API
+
+### Marco 12 — Execução por streaming, contador total e download direto do arquivo
+- **Nada materializa o resultado.** O executor lê o cursor com `conn.stream()` + `AsyncResult.partitions(FETCH_CHUNK_SIZE)` e **empurra** cada bloco para um `RowSink`; o pico de memória do worker é o de um bloco, não o do resultado (verificado com `tracemalloc` em `tests/adapters/executors/test_postgres_integration.py`)
+- O port é **push** (`execute(dataset, request, columns, sink)`), e não pull, porque um `AsyncResult` só vale enquanto a conexão que o produziu está aberta — devolver um iterador ao chamador entregaria um cursor morto
+- `RowSink` (`write`/`close`/`abort`) é declarado em `application/ports/`; as implementações — arquivo CSV, arquivo JSONL, Redis — ficam em `adapters/`, pela mesma razão que já valia para o `ResultExporter`. O sink nasce aberto, criado por uma fábrica que já tem as colunas (`open_writer`)
+- `FanOutSink` (`application/use_cases/_fan_out.py`) distribui cada bloco para todos os destinos numa passada. Um destino que falha sai da lista, é abortado e os demais seguem: o resultado já foi calculado, então perder o cache ou o arquivo é perder uma otimização, não a resposta
+- Três artefatos por job: `<query_id>.csv` (download), `<query_id>.jsonl` (de onde a API transmite o corpo JSON) e `<query_id>.meta.json`. O meta é gravado **por último** — sua existência é a marca de export completo, e é o TTL dele que vale para o conjunto (o CSV de uma consulta longa é escrito muito antes do fim). Também é o que deixa `GET /v1/query/{query_id}` responder depois de o resultado retido do `arq` expirar
+- **JSON não sai do CSV.** A RFC 4180 não distingue `NULL` de string vazia; derivar o corpo JSON do CSV perderia essa diferença. Daí o `.jsonl`, uma lista JSON por linha, que a API costura dentro do envelope de `json_envelope()`
+- O sink do Redis acumula num buffer e **desiste ao cruzar `CACHE_MAX_PAYLOAD_BYTES`/`CACHE_MAX_ROWS`, liberando o que acumulou** — o pico é o teto, por construção. Desistir não é erro, como já era antes
+- `meta.total_rows` (+ header `X-Total-Rows`) é o total antes de `limit`/`offset`, via `COUNT(*) OVER ()`. A janela **só entra quando pagina**, porque obriga o banco a apurar o resultado inteiro antes da primeira linha: `offset > 0` → janela no SELECT; `offset == 0` e vieram menos que o `limit` → o total é o próprio `row_count`, de graça; `offset == 0` e bateu no `limit` → `build_count()`, uma segunda passada. A coluna auxiliar é fatiada fora antes de chegar ao sink e nunca vira campo do resultado
+- `QueryResult.rows` aceita `None` ("as linhas existem, mas não estão aqui") e `QueryResult.streamed()` monta o descritor que o worker devolve pela fila. Ganho colateral: `arq:result:<query_id>` deixa de guardar megabytes
+- `_response_for` passou a consultar o exportador. A premissa antiga ("um resultado que chega por aqui nunca vem do worker") caiu com o caminho único de execução — sem isso, a resposta do `POST` inline sairia sem linhas
+- **Elasticsearch fica de fora**: atende o port novo materializando como antes, com `total_rows=None`. Não há cursor a paginar nem função de janela, e o `max_limit` de um índice é da ordem de mil linhas — não é a fonte do estouro de memória que motivou o marco
 
 ## Como pedir ao Claude Code para trabalhar em um marco
 

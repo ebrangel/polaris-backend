@@ -10,6 +10,7 @@ chaves ausentes (`format` só aparece na coluna que tem um) — controle explíc
 simples que configurar exclusão de nulos em modelos aninhados.
 """
 
+import json
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -23,6 +24,7 @@ from domain.models import (
     QueryRequest,
     QueryResult,
     QueryStatus,
+    ResultMeta,
     Schema,
     SortDirection,
 )
@@ -131,18 +133,68 @@ def present_result(
         # os códigos da seção 2.5), o que passa ao largo da serialização automática do
         # FastAPI — sem isto, uma coluna `numeric`/`date` do Postgres (→ `Decimal`/
         # `date`) derrubaria a resposta com `TypeError`.
-        "rows": [[jsonable(value) for value in row] for row in result.rows],
-        "meta": {
-            "row_count": result.meta.row_count,
-            "cached": result.meta.cached,
-            "execution_ms": result.meta.execution_ms,
-            "dataset_used": result.meta.dataset_used,
-        },
+        "rows": [[jsonable(value) for value in row] for row in result.rows or ()],
+        "meta": present_meta(result.meta),
     }
     if export is not None:
         body["download_url"] = download_url_for(result.query_id)
         body["download_expires_at"] = export.expires_at.isoformat()
     return body
+
+
+def present_meta(meta: ResultMeta) -> dict[str, Any]:
+    """O bloco `meta` da seção 2.3, compartilhado com o corpo JSON transmitido.
+
+    `total_rows` sai mesmo quando é `None`, e isso é deliberado: omitir a chave faria o
+    cliente não saber distinguir "este servidor não informa o total" de "o total não foi
+    apurado para esta consulta". Explícito, `null` diz a segunda coisa.
+    """
+    return {
+        "row_count": meta.row_count,
+        "cached": meta.cached,
+        "execution_ms": meta.execution_ms,
+        "dataset_used": meta.dataset_used,
+        "total_rows": meta.total_rows,
+    }
+
+
+def json_envelope(
+    result: QueryResult, *, export: ExportMetadata | None = None
+) -> tuple[bytes, bytes]:
+    """Prefixo e sufixo do corpo da seção 2.3, para as linhas serem costuradas no meio.
+
+    É o que permite responder JSON a partir do arquivo `.jsonl` sem materializar as linhas:
+    a API escreve o prefixo, repassa o arquivo (cujas linhas já são listas JSON, uma por
+    linha, e só precisam de vírgulas entre elas) e fecha com o sufixo.
+
+    Note que `meta` vai no **fim**, e não no começo: seus números vêm do descritor, mas
+    montar o envelope inteiro antes de conhecer o corpo é o que deixa o prefixo ser
+    escrito no socket imediatamente.
+    """
+    assert result.meta is not None
+    columns = []
+    for column in result.columns:
+        item: dict[str, Any] = {"field": column.field, "type": column.type.value}
+        if column.format is not None:
+            item["format"] = column.format
+        columns.append(item)
+
+    head = (
+        '{"query_id":' + json.dumps(result.query_id)
+        + ',"status":' + json.dumps(result.status.value)
+        + ',"columns":' + json.dumps(columns)
+        + ',"rows":['
+    )
+
+    tail_body: dict[str, Any] = {"meta": present_meta(result.meta)}
+    if export is not None:
+        tail_body["download_url"] = download_url_for(result.query_id)
+        tail_body["download_expires_at"] = export.expires_at.isoformat()
+    # `json.dumps` de um dict e depois a troca da chave de abertura por uma vírgula: o
+    # sufixo é a cauda de um objeto já aberto pelo prefixo.
+    tail = "]," + json.dumps(tail_body)[1:]
+
+    return head.encode("utf-8"), tail.encode("utf-8")
 
 
 def present_schema_summary(schema: Schema) -> dict[str, Any]:

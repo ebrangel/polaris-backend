@@ -5,12 +5,13 @@ Marco 2 não quer acoplar `adapters/` a `application/`). O Marco 4 reutiliza est
 para testar a orquestração do use case `ExecuteQuery` sem nenhum banco real.
 """
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime, timedelta
 
 from application.catalog_codec import decompile_schema
 from application.ports.cache_gateway import CacheStats
-from application.ports.result_exporter import ExportMetadata
+from application.ports.result_exporter import ExportKind, ExportMetadata
+from application.ports.row_sink import StreamedResult
 from domain.models import CatalogVersion, Dataset, QueryRequest, QueryResult, QueryStatus
 
 
@@ -55,16 +56,26 @@ class InMemoryCatalogRepository:
 
 
 class StubQueryExecutor:
-    """Fake do `QueryExecutor`: resultado programável, chamadas registradas."""
+    """Fake do `QueryExecutor`: linhas programáveis, chamadas registradas.
+
+    Empurra `rows` para o sink em blocos de `chunk_size` — o bastante para os testes
+    exercitarem o caminho de várias escritas sem precisar de banco.
+    """
 
     def __init__(
         self,
-        result: QueryResult | None = None,
+        rows: Sequence[tuple] = (),
         *,
         raises: Exception | None = None,
+        total_rows: int | None = None,
+        execution_ms: int = 0,
+        chunk_size: int = 2,
     ) -> None:
-        self.result = result
+        self.rows = list(rows)
         self.raises = raises
+        self.total_rows = total_rows
+        self.execution_ms = execution_ms
+        self.chunk_size = chunk_size
         self.calls: list[tuple[Dataset, QueryRequest, tuple]] = []
 
     async def execute(
@@ -72,17 +83,19 @@ class StubQueryExecutor:
         dataset: Dataset,
         request: QueryRequest,
         columns: tuple,
-    ) -> QueryResult:
+        sink: object,
+    ) -> StreamedResult:
         self.calls.append((dataset, request, columns))
         if self.raises is not None:
             raise self.raises
-        if self.result is not None:
-            return self.result
-        return QueryResult.completed(
-            query_id=request.query_id,
-            columns=columns,
-            rows=(),
-            dataset_used=dataset.name,
+        for start in range(0, len(self.rows), self.chunk_size):
+            await sink.write(self.rows[start : start + self.chunk_size])
+        return StreamedResult(
+            row_count=len(self.rows),
+            total_rows=(
+                self.total_rows if self.total_rows is not None else len(self.rows)
+            ),
+            execution_ms=self.execution_ms,
         )
 
 
@@ -102,7 +115,22 @@ class InMemoryCacheGateway:
             self.hits += 1
         return result
 
-    async def set(self, key: str, result: QueryResult, ttl_seconds: int | None = None) -> None:
+    async def open_writer(
+        self,
+        key: str,
+        columns: tuple,
+        query_id: str,
+        dataset_used: str,
+        ttl_seconds: int | None = None,
+    ) -> "_FakeCacheSink":
+        return _FakeCacheSink(self._store, key, columns, query_id, dataset_used)
+
+    async def set(self, key: str, result: QueryResult) -> None:
+        """Auxiliar de teste (não faz parte do port): semeia uma entrada pronta.
+
+        O port grava bloco a bloco; um teste que só precisa de um acerto de cache não
+        deveria encenar o streaming para chegar lá.
+        """
         if result.status is not QueryStatus.COMPLETED:
             raise ValueError("só resultados com status=completed são cacheáveis")
         self._store[key] = result
@@ -123,6 +151,73 @@ class InMemoryCacheGateway:
 
     async def stats(self) -> CacheStats:
         return CacheStats(hits=self.hits, misses=self.misses)
+
+
+class CollectingRowSink:
+    """Fake do `RowSink`: guarda os blocos recebidos, sem destino nenhum.
+
+    Serve aos testes que querem inspecionar *o que* o executor empurrou — inclusive em
+    quantos blocos, que é o que distingue leitura em blocos de materialização.
+    """
+
+    def __init__(self, *, raises: Exception | None = None) -> None:
+        self.raises = raises
+        #: Um item por chamada de `write` — preserva o recorte em blocos.
+        self.chunks: list[list[tuple]] = []
+        self.closed_with: StreamedResult | None = None
+        self.aborted = False
+
+    @property
+    def rows(self) -> list[tuple]:
+        return [row for chunk in self.chunks for row in chunk]
+
+    async def write(self, rows: Sequence[tuple]) -> None:
+        if self.raises is not None:
+            raise self.raises
+        self.chunks.append([tuple(row) for row in rows])
+
+    async def close(self, result: StreamedResult) -> None:
+        self.closed_with = result
+
+    async def abort(self) -> None:
+        self.aborted = True
+
+
+class _FakeCacheSink:
+    """Sink do `InMemoryCacheGateway`: acumula as linhas e materializa no `close`."""
+
+    def __init__(
+        self,
+        store: dict[str, QueryResult],
+        key: str,
+        columns: tuple,
+        query_id: str,
+        dataset_used: str,
+    ) -> None:
+        self._store = store
+        self._key = key
+        self._columns = columns
+        self._query_id = query_id
+        self._dataset_used = dataset_used
+        self._rows: list[tuple] = []
+        self.aborted = False
+
+    async def write(self, rows: Sequence[tuple]) -> None:
+        self._rows.extend(tuple(row) for row in rows)
+
+    async def close(self, result: StreamedResult) -> None:
+        self._store[self._key] = QueryResult.completed(
+            query_id=self._query_id,
+            columns=self._columns,
+            rows=self._rows,
+            dataset_used=self._dataset_used,
+            execution_ms=result.execution_ms,
+            total_rows=result.total_rows,
+        )
+
+    async def abort(self) -> None:
+        self.aborted = True
+        self._rows = []
 
 
 class InMemoryRateLimiter:
@@ -172,46 +267,76 @@ class InMemoryResultExporter:
     def __init__(self, ttl_seconds: int = 86_400, *, raises: Exception | None = None) -> None:
         self._ttl = timedelta(seconds=ttl_seconds)
         self.raises = raises
-        self._files: dict[str, bytes] = {}
+        self._files: dict[tuple[str, ExportKind], bytes] = {}
+        self._results: dict[str, QueryResult] = {}
         self._created: dict[str, datetime] = {}
         self.calls: list[str] = []
         #: `query_id`s que `open()` deve fingir que sumiram entre o `stat()` e a leitura.
         self.vanished: set[str] = set()
 
-    def _metadata(self, query_id: str) -> ExportMetadata:
+    def _metadata(self, query_id: str, kind: ExportKind) -> ExportMetadata:
         created_at = self._created[query_id]
         return ExportMetadata(
             query_id=query_id,
-            size_bytes=len(self._files[query_id]),
+            kind=kind,
+            size_bytes=len(self._files[(query_id, kind)]),
             created_at=created_at,
             expires_at=created_at + self._ttl,
         )
 
-    async def export(self, result: QueryResult) -> ExportMetadata:
-        self.calls.append(result.query_id)
+    async def open_writer(
+        self, query_id: str, columns: tuple, dataset_used: str
+    ) -> "_FakeExportSink":
+        self.calls.append(query_id)
         if self.raises is not None:
             raise self.raises
+        return _FakeExportSink(self, query_id, columns, dataset_used)
+
+    async def export(self, result: QueryResult) -> ExportMetadata:
+        """Auxiliar de teste (não faz parte do port): grava um `QueryResult` inteiro.
+
+        O port é alimentado bloco a bloco pelo executor; um teste que só quer um export
+        pronto para exercitar download, TTL ou status não deveria ter que encenar o
+        streaming. Aqui o resultado já está em memória, então empurrá-lo de uma vez é
+        exatamente equivalente.
+        """
         if result.status is not QueryStatus.COMPLETED:
             raise ValueError("só resultados com status=completed são exportáveis")
+        assert result.meta is not None
+        sink = await self.open_writer(
+            result.query_id, result.columns, result.meta.dataset_used
+        )
+        await sink.write(list(result.rows or ()))
+        await sink.close(
+            StreamedResult(
+                row_count=result.meta.row_count,
+                total_rows=result.meta.total_rows,
+                execution_ms=result.meta.execution_ms,
+            )
+        )
+        return self._metadata(result.query_id, ExportKind.CSV)
 
-        from adapters.csv_format import csv_lines  # import local: o fake não é adapter
-
-        self._files[result.query_id] = "".join(csv_lines(result)).encode("utf-8")
-        self._created[result.query_id] = datetime.now(UTC)
-        return self._metadata(result.query_id)
-
-    async def stat(self, query_id: str) -> ExportMetadata | None:
-        if query_id not in self._files:
+    async def stat(
+        self, query_id: str, kind: ExportKind = ExportKind.CSV
+    ) -> ExportMetadata | None:
+        if (query_id, kind) not in self._files:
             return None
-        metadata = self._metadata(query_id)
+        metadata = self._metadata(query_id, kind)
         if metadata.expires_at <= datetime.now(UTC):
             return None
         return metadata
 
-    async def open(self, query_id: str) -> AsyncIterator[bytes]:
-        if query_id in self.vanished or query_id not in self._files:
+    async def read_result(self, query_id: str) -> QueryResult | None:
+        if await self.stat(query_id, ExportKind.META) is None:
+            return None
+        return self._results.get(query_id)
+
+    async def open(
+        self, query_id: str, kind: ExportKind = ExportKind.CSV
+    ) -> AsyncIterator[bytes]:
+        if query_id in self.vanished or (query_id, kind) not in self._files:
             raise FileNotFoundError(query_id)
-        content = self._files[query_id]
+        content = self._files[(query_id, kind)]
 
         async def chunks() -> AsyncIterator[bytes]:
             yield content
@@ -226,13 +351,70 @@ class InMemoryResultExporter:
             if created + self._ttl <= now
         ]
         for query_id in expired:
-            del self._files[query_id]
+            for kind in ExportKind:
+                self._files.pop((query_id, kind), None)
+            self._results.pop(query_id, None)
             del self._created[query_id]
         return len(expired)
 
     def expire(self, query_id: str) -> None:
         """Auxiliar de teste: envelhece o arquivo para além do TTL."""
         self._created[query_id] = datetime.now(UTC) - self._ttl - timedelta(seconds=1)
+
+
+class _FakeExportSink:
+    """Sink do `InMemoryResultExporter`: monta CSV, JSONL e o descritor em memória."""
+
+    def __init__(
+        self,
+        exporter: "InMemoryResultExporter",
+        query_id: str,
+        columns: tuple,
+        dataset_used: str,
+    ) -> None:
+        self._exporter = exporter
+        self._query_id = query_id
+        self._columns = columns
+        self._dataset_used = dataset_used
+        self._rows: list[tuple] = []
+        self.aborted = False
+
+    async def write(self, rows: Sequence[tuple]) -> None:
+        self._rows.extend(tuple(row) for row in rows)
+
+    async def close(self, result: StreamedResult) -> None:
+        # Imports locais: o fake não é adapter, e trazer o formatador para o topo faria
+        # `tests/fakes.py` parecer parte da camada de adapters.
+        import json as _json
+
+        from adapters.csv_format import CsvRowFormatter
+        from adapters.serialization import jsonable
+
+        formatter = CsvRowFormatter()
+        csv_text = formatter.header(self._columns) + "".join(
+            formatter.row(row) for row in self._rows
+        )
+        jsonl_text = "".join(
+            _json.dumps([jsonable(v) for v in row], ensure_ascii=False) + "\n"
+            for row in self._rows
+        )
+
+        self._exporter._files[(self._query_id, ExportKind.CSV)] = csv_text.encode("utf-8")
+        self._exporter._files[(self._query_id, ExportKind.JSONL)] = jsonl_text.encode("utf-8")
+        self._exporter._files[(self._query_id, ExportKind.META)] = b"{}"
+        self._exporter._results[self._query_id] = QueryResult.streamed(
+            query_id=self._query_id,
+            columns=self._columns,
+            row_count=result.row_count,
+            total_rows=result.total_rows,
+            dataset_used=self._dataset_used,
+            execution_ms=result.execution_ms,
+        )
+        self._exporter._created[self._query_id] = datetime.now(UTC)
+
+    async def abort(self) -> None:
+        self.aborted = True
+        self._rows = []
 
 
 class InMemoryJobQueue:

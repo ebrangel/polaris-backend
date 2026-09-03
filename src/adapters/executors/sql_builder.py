@@ -25,6 +25,11 @@ from domain.models import (
     TableModel,
 )
 
+#: Rótulo da coluna auxiliar de `COUNT(*) OVER ()`. Prefixo `__` para não colidir com
+#: nome lógico de campo algum: o catálogo usa nomes como `sigla_uf`, e um campo que
+#: começasse com dois sublinhados nem passaria pela validação do schema.
+TOTAL_ROWS_LABEL = "__total_rows"
+
 _AGG_FUNCS = {
     Aggregation.SUM: sa.func.sum,
     Aggregation.AVG: sa.func.avg,
@@ -129,10 +134,31 @@ def _column_expr(logical_name: str, dataset: Dataset, physical: _Physical) -> Co
     return _AGG_FUNCS[mapping.agg](col).label(logical_name)
 
 
-def build_select(dataset: Dataset, request: QueryRequest, columns: tuple[DomainColumn, ...]) -> Select:
-    """Monta o `Select` completo: projeção (na ordem de `columns`), `WHERE`, `GROUP BY`
-    (só quando há medida pedida), `ORDER BY`, `LIMIT`/`OFFSET`.
+def needs_window_count(request: QueryRequest) -> bool:
+    """Se a projeção leva a coluna `COUNT(*) OVER ()` desta vez.
+
+    A janela obriga o banco a apurar o resultado inteiro antes de devolver a primeira
+    linha — o `LIMIT` deixa de economizar trabalho. Por isso ela só entra quando o total
+    não sai de graça:
+
+    - `offset == 0` e vieram menos linhas que o `limit`: o total **é** o número de linhas
+      lidas, e nada precisa ser pedido ao banco;
+    - `offset == 0` e o resultado bateu no `limit`: pode haver mais, mas isso só se sabe
+      depois de drenar — aí o executor pede `build_count()`;
+    - `offset > 0`: qualquer contagem local seria parcial, então a janela entra no próprio
+      SELECT e o total sai na mesma passada.
+
+    Note que só o terceiro caso é decidível aqui, na construção do SQL; os dois primeiros
+    dependem de quantas linhas vieram.
     """
+    return request.offset > 0
+
+
+def _build_core(
+    dataset: Dataset, request: QueryRequest, columns: tuple[DomainColumn, ...]
+) -> tuple[Select, dict[str, ColumnElement]]:
+    """A consulta sem paginação nem coluna de janela — o que `build_select` e
+    `build_count` têm em comum."""
     physical = _resolve_physical(dataset)
 
     field_names = [c.field for c in columns]
@@ -151,6 +177,16 @@ def build_select(dataset: Dataset, request: QueryRequest, columns: tuple[DomainC
     if measure_fields and dimension_fields:
         stmt = stmt.group_by(*(exprs[name] for name in dimension_fields))
 
+    return stmt, exprs
+
+
+def _apply_order_by(
+    stmt: Select,
+    dataset: Dataset,
+    request: QueryRequest,
+    exprs: Mapping[str, ColumnElement],
+) -> Select:
+    physical = _resolve_physical(dataset)
     order_exprs = []
     for order in request.order_by:
         # `or` não serve aqui: ColumnElement sobrescreve __bool__ para levantar
@@ -161,7 +197,44 @@ def build_select(dataset: Dataset, request: QueryRequest, columns: tuple[DomainC
         order_exprs.append(expr.desc() if order.direction is SortDirection.DESC else expr.asc())
     if order_exprs:
         stmt = stmt.order_by(*order_exprs)
+    return stmt
+
+
+def build_select(dataset: Dataset, request: QueryRequest, columns: tuple[DomainColumn, ...]) -> Select:
+    """Monta o `Select` completo: projeção (na ordem de `columns`), `WHERE`, `GROUP BY`
+    (só quando há medida pedida), `ORDER BY`, `LIMIT`/`OFFSET`.
+
+    Quando `needs_window_count(request)`, a projeção ganha uma coluna extra
+    `COUNT(*) OVER () AS __total_rows` no fim. Ela **não** entra em `columns`, e por isso
+    fica de fora de `GROUP BY` e `ORDER BY`, que são derivados de `columns` e não do
+    `Select` — o que é exatamente o certo: com `GROUP BY`, a janela conta os grupos, ou
+    seja, as linhas do resultado. O executor retira essa coluna de cada linha antes de
+    entregá-la ao sink.
+    """
+    stmt, exprs = _build_core(dataset, request, columns)
+
+    if needs_window_count(request):
+        stmt = stmt.add_columns(sa.func.count().over().label(TOTAL_ROWS_LABEL))
+
+    stmt = _apply_order_by(stmt, dataset, request, exprs)
 
     if request.limit is not None:
         stmt = stmt.limit(request.limit)
     return stmt.offset(request.offset)
+
+
+def build_count(
+    dataset: Dataset, request: QueryRequest, columns: tuple[DomainColumn, ...]
+) -> Select:
+    """`SELECT count(*) FROM (<a mesma consulta, sem paginação>)`.
+
+    É o plano B de `needs_window_count`: serve o caso `offset == 0` em que o resultado
+    bateu no `limit` e portanto pode estar truncado — situação que só se conhece depois
+    de ler as linhas, tarde demais para acrescentar uma coluna ao SELECT.
+
+    A subconsulta sai sem `ORDER BY`: ordenar para depois contar é trabalho jogado fora, e
+    alguns bancos recusam `ORDER BY` em subconsulta sem `LIMIT`. Com `GROUP BY`, contar as
+    linhas da subconsulta é contar os grupos — a mesma semântica da janela.
+    """
+    core, _ = _build_core(dataset, request, columns)
+    return sa.select(sa.func.count()).select_from(core.subquery())

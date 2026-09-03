@@ -48,8 +48,9 @@ Com o catálogo de exemplo completo, isso significa `DW_VENDAS_PG_URL`, `DW_VEND
 | `HEAVY_POOL_SIZE` | `3` | Conexões do pool pesado, **por datasource** |
 | `COST_THRESHOLD` | `10000.0` | Acima disso a consulta vai para a fila (custo do `EXPLAIN`) |
 | `HEURISTIC_COST_THRESHOLD` | `30.0` | Mesmo critério, para a heurística de fallback — escala diferente (contagem de campos), por isso é outro número |
+| `FETCH_CHUNK_SIZE` | `1000` | Linhas lidas do cursor por vez no worker. Não é o `LIMIT` da consulta — é o lote que viaja do banco de cada vez, e portanto o teto de memória do laço de leitura |
 | `CACHE_TTL_SECONDS` | `3600` | TTL padrão das entradas de cache |
-| `CACHE_MAX_ROWS` | `100000` | Resultado com mais linhas que isso não é cacheado (não é erro: a consulta seguinte executa de novo) |
+| `CACHE_MAX_ROWS` | `100000` | Resultado com mais linhas que isso não é cacheado (não é erro: a consulta seguinte executa de novo). O sink desiste ao cruzar o teto e libera o buffer, então o pico de memória é o próprio teto |
 | `CACHE_MAX_PAYLOAD_BYTES` | `8388608` | Idem, por tamanho do JSON gravado no Redis |
 | `DEFAULT_MAX_LIMIT` | `50000` | Teto de linhas para schema que não declara `max_limit` no catálogo; o do catálogo sempre tem precedência |
 | `SLOW_QUERY_THRESHOLD_MS` | `2000` | Consultas acima disso geram log `WARNING` |

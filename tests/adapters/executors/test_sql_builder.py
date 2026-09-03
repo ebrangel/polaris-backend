@@ -17,7 +17,7 @@ from fixtures import (
 )
 from sqlalchemy.dialects import oracle, postgresql
 
-from adapters.executors.sql_builder import build_select
+from adapters.executors.sql_builder import build_count, build_select, needs_window_count
 from domain.models import (
     Aggregation,
     ColumnMapping,
@@ -237,3 +237,92 @@ def test_operadores_numericos(operator, value, expected):
     sql = _compile(build_select(dataset, request, columns), postgresql.dialect())
 
     assert expected in sql
+
+
+# --- Contador total: COUNT(*) OVER () (Marco 12) -------------------------------------------
+
+
+def test_sem_offset_a_projecao_nao_leva_a_janela():
+    """O caso comum não paga nada: sem `offset`, o total ou é o número de linhas lidas
+    (se vieram menos que o `limit`) ou sai de `build_count` depois — nunca de uma janela
+    que obriga o banco a apurar tudo antes da primeira linha."""
+    schema = estoque_schema()
+    dataset = estoque_atual_pg()
+    request = QueryRequest(
+        schema="estoque", dimensions=("filial",), measures=("quantidade_disponivel",), limit=10
+    )
+
+    assert needs_window_count(request) is False
+    sql = _compile(build_select(dataset, request, schema.columns_for(request)), postgresql.dialect())
+    assert "OVER" not in sql
+
+
+def test_com_offset_a_projecao_leva_a_janela():
+    schema = estoque_schema()
+    dataset = estoque_atual_pg()
+    request = QueryRequest(
+        schema="estoque",
+        dimensions=("filial",),
+        measures=("quantidade_disponivel",),
+        limit=10,
+        offset=20,
+    )
+
+    assert needs_window_count(request) is True
+    sql = _compile(build_select(dataset, request, schema.columns_for(request)), postgresql.dialect())
+    assert "count(*) OVER () AS __total_rows" in sql
+
+
+def test_a_janela_fica_fora_do_group_by_e_do_order_by():
+    """`GROUP BY`/`ORDER BY` são derivados de `columns`, não do `Select` — é o que faz a
+    coluna auxiliar não contaminar a agregação. Com `GROUP BY`, a janela conta os grupos,
+    que é a semântica de "linhas do resultado" que o contrato promete."""
+    schema = estoque_schema()
+    dataset = estoque_atual_pg()
+    request = QueryRequest(
+        schema="estoque",
+        dimensions=("filial",),
+        measures=("quantidade_disponivel",),
+        order_by=(OrderBy(field="quantidade_disponivel", direction=SortDirection.DESC),),
+        offset=20,
+    )
+
+    sql = _compile(build_select(dataset, request, schema.columns_for(request)), postgresql.dialect())
+
+    assert "GROUP BY app.vw_estoque_atual.filial" in sql
+    assert "__total_rows" not in sql.split("GROUP BY")[1]
+
+
+def test_a_janela_compila_em_oracle():
+    schema = vendas_schema()
+    dataset = vendas_detalhado()
+    request = QueryRequest(
+        schema="vendas", dimensions=("sigla_uf",), measures=("valor_total",), offset=100
+    )
+
+    sql = _compile(build_select(dataset, request, schema.columns_for(request)), oracle.dialect())
+
+    assert 'count(*) OVER () AS "__total_rows"' in sql
+
+
+def test_build_count_envolve_a_consulta_sem_paginacao_nem_ordenacao():
+    """Ordenar para depois contar é trabalho jogado fora, e alguns bancos recusam
+    `ORDER BY` em subconsulta sem `LIMIT`."""
+    schema = estoque_schema()
+    dataset = estoque_atual_pg()
+    request = QueryRequest(
+        schema="estoque",
+        dimensions=("filial",),
+        measures=("quantidade_disponivel",),
+        order_by=(OrderBy(field="filial", direction=SortDirection.ASC),),
+        limit=10,
+        offset=5,
+    )
+
+    sql = _compile(build_count(dataset, request, schema.columns_for(request)), postgresql.dialect())
+
+    assert sql.startswith("SELECT count(*)")
+    assert "GROUP BY app.vw_estoque_atual.filial" in sql  # conta os grupos
+    assert "ORDER BY" not in sql
+    assert "LIMIT" not in sql
+    assert "OFFSET" not in sql

@@ -17,8 +17,9 @@ from fixtures import eventos_navegacao_es, eventos_schema
 from testcontainers.community.elasticsearch import ElasticSearchContainer
 
 from adapters.executors.elasticsearch_executor import ElasticsearchQueryExecutor
+from fakes import CollectingRowSink
 from domain.errors import QueryTimeoutError
-from domain.models import Filter, FilterOperator, QueryRequest, QueryStatus
+from domain.models import Filter, FilterOperator, QueryRequest
 
 pytestmark = pytest.mark.integration
 
@@ -102,15 +103,19 @@ async def test_exemplo_da_secao_1_1_com_as_duas_dimensoes(es_client):
     )
     columns = schema.columns_for(request)
 
-    result = await executor.execute(dataset, request, columns)
+    sink = CollectingRowSink()
+    streamed = await executor.execute(dataset, request, columns, sink)
 
-    assert result.status is QueryStatus.COMPLETED
-    assert set(result.rows) == {
+    assert set(sink.rows) == {
         ("BR", "mobile", 100.0, 1),
         ("BR", "desktop", 300.0, 1),
         ("AR", "mobile", 50.0, 1),
     }
-    assert result.meta.dataset_used == "eventos_navegacao_es"
+    assert streamed.row_count == 3
+    # O Elasticsearch não tem função de janela, e o `hits.total` de uma busca com
+    # `size: 0` conta *documentos*, não buckets — devolvê-lo responderia outra pergunta.
+    # `None` diz "não foi apurado", que é a verdade (Marco 12 cobre só o caminho SQL).
+    assert streamed.total_rows is None
 
 
 async def test_filtro_eq_sobre_dimensao(es_client):
@@ -125,9 +130,10 @@ async def test_filtro_eq_sobre_dimensao(es_client):
     )
     columns = schema.columns_for(request)
 
-    result = await executor.execute(dataset, request, columns)
+    sink = CollectingRowSink()
+    await executor.execute(dataset, request, columns, sink)
 
-    assert result.rows == (("BR", 2),)
+    assert tuple(sink.rows) == (("BR", 2),)
 
 
 async def test_zero_dimensoes_agrega_o_indice_inteiro(es_client):
@@ -137,9 +143,10 @@ async def test_zero_dimensoes_agrega_o_indice_inteiro(es_client):
     request = QueryRequest(schema="eventos_navegacao", measures=("total_eventos",))
     columns = schema.columns_for(request)
 
-    result = await executor.execute(dataset, request, columns)
+    sink = CollectingRowSink()
+    await executor.execute(dataset, request, columns, sink)
 
-    assert result.rows == ((3,),)
+    assert tuple(sink.rows) == ((3,),)
 
 
 async def test_timeout_real_vira_query_timeout_error(es_client):
@@ -152,4 +159,4 @@ async def test_timeout_real_vira_query_timeout_error(es_client):
     columns = schema.columns_for(request)
 
     with pytest.raises(QueryTimeoutError):
-        await executor.execute(dataset, request, columns)
+        await executor.execute(dataset, request, columns, CollectingRowSink())

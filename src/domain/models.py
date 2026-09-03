@@ -641,6 +641,12 @@ class ResultMeta:
     cached: bool
     execution_ms: int
     dataset_used: str
+    #: Linhas que o resultado teria **sem** `limit`/`offset` — o `COUNT(*) OVER ()` da
+    #: seção 2.3. `None` quando o total não foi apurado: o executor de Elasticsearch não
+    #: tem função de janela, e o caminho SQL só paga a contagem quando o resultado pode
+    #: estar truncado (ver `sql_builder._needs_window_count`). `None` significa "não se
+    #: sabe", nunca "zero" — daí não ter default 0.
+    total_rows: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -654,13 +660,18 @@ class QueryResult:
     query_id: str
     status: QueryStatus
     columns: tuple[Column, ...] = ()
-    rows: tuple[tuple[Any, ...], ...] = ()
+    #: `()` é resultado vazio; `None` é "as linhas existem, mas não estão aqui" — elas
+    #: foram transmitidas direto para os destinos finais (arquivo de export, cache) sem
+    #: passar por uma cópia em memória, e quem precisa delas as lê de lá. Só um resultado
+    #: `completed` pode ter `rows=None`; ver `QueryResult.streamed`.
+    rows: tuple[tuple[Any, ...], ...] | None = ()
     meta: ResultMeta | None = None
     error: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "columns", tuple(self.columns))
-        object.__setattr__(self, "rows", tuple(tuple(row) for row in self.rows))
+        if self.rows is not None:
+            object.__setattr__(self, "rows", tuple(tuple(row) for row in self.rows))
 
         # Violar estas invariantes é erro de programação de quem monta o resultado
         # (executor ou use case), não erro do cliente nem do catálogo.
@@ -669,18 +680,23 @@ class QueryResult:
                 raise ValueError(
                     f"O resultado '{self.query_id}' está concluído mas não tem `meta`."
                 )
-            width = len(self.columns)
-            for index, row in enumerate(self.rows):
-                if len(row) != width:
+            # Com `rows=None` não há o que conferir: `row_count` e `total_rows` vieram de
+            # quem drenou o cursor, e é o artefato em disco (ou o cache) que guarda as
+            # linhas. Conferir a largura exigiria justamente a materialização que este
+            # caminho existe para evitar.
+            if self.rows is not None:
+                width = len(self.columns)
+                for index, row in enumerate(self.rows):
+                    if len(row) != width:
+                        raise ValueError(
+                            f"A linha {index} tem {len(row)} valores, mas o resultado "
+                            f"declara {width} colunas."
+                        )
+                if self.meta.row_count != len(self.rows):
                     raise ValueError(
-                        f"A linha {index} tem {len(row)} valores, mas o resultado "
-                        f"declara {width} colunas."
+                        f"`meta.row_count` ({self.meta.row_count}) não corresponde ao "
+                        f"número de linhas ({len(self.rows)})."
                     )
-            if self.meta.row_count != len(self.rows):
-                raise ValueError(
-                    f"`meta.row_count` ({self.meta.row_count}) não corresponde ao "
-                    f"número de linhas ({len(self.rows)})."
-                )
         else:
             if self.rows or self.columns or self.meta is not None:
                 raise ValueError(
@@ -702,8 +718,14 @@ class QueryResult:
         dataset_used: str,
         cached: bool = False,
         execution_ms: int = 0,
+        total_rows: int | None = None,
     ) -> "QueryResult":
-        """Resultado pronto — `meta.row_count` é derivado das linhas."""
+        """Resultado pronto, com as linhas em mãos — `meta.row_count` é derivado delas.
+
+        Continua sendo o construtor de quem já tem tudo em memória: leitura de cache,
+        executor de Elasticsearch e testes. Quem drenou um cursor sem materializar usa
+        `streamed()`.
+        """
         materialized = tuple(tuple(row) for row in rows)
         return cls(
             query_id=query_id,
@@ -715,6 +737,40 @@ class QueryResult:
                 cached=cached,
                 execution_ms=execution_ms,
                 dataset_used=dataset_used,
+                total_rows=total_rows,
+            ),
+        )
+
+    @classmethod
+    def streamed(
+        cls,
+        query_id: str,
+        columns: Iterable[Column],
+        *,
+        row_count: int,
+        dataset_used: str,
+        total_rows: int | None = None,
+        cached: bool = False,
+        execution_ms: int = 0,
+    ) -> "QueryResult":
+        """Resultado concluído cujas linhas **não** estão em memória (`rows=None`).
+
+        É o que o worker devolve depois de transmitir o cursor direto para os destinos
+        finais: o valor de retorno do job carrega só o descritor (colunas e `meta`), e as
+        linhas ficam no arquivo de export e no cache. Sem isso, o resultado inteiro
+        voltaria a ser materializado só para atravessar a fila.
+        """
+        return cls(
+            query_id=query_id,
+            status=QueryStatus.COMPLETED,
+            columns=tuple(columns),
+            rows=None,
+            meta=ResultMeta(
+                row_count=row_count,
+                cached=cached,
+                execution_ms=execution_ms,
+                dataset_used=dataset_used,
+                total_rows=total_rows,
             ),
         )
 

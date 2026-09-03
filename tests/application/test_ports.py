@@ -20,9 +20,11 @@ from application.ports.job_queue import JobQueue
 from application.ports.query_executor import QueryExecutor
 from application.ports.rate_limiter import RateLimiter
 from application.ports.result_exporter import ResultExporter
+from application.ports.row_sink import RowSink
 from domain.errors import QueryTimeoutError
 from domain.models import QueryRequest, QueryResult
 from fakes import (
+    CollectingRowSink,
     InMemoryCacheGateway,
     InMemoryCatalogInvalidator,
     InMemoryCatalogRepository,
@@ -42,15 +44,19 @@ PORT_METHODS = {
         ("get_active_version", "list_active_versions", "publish_new_version"),
     ),
     QueryExecutor: (StubQueryExecutor, ("execute",)),
-    CacheGateway: (InMemoryCacheGateway, ("get", "set", "delete", "clear", "stats")),
+    CacheGateway: (
+        InMemoryCacheGateway,
+        ("get", "open_writer", "delete", "clear", "stats"),
+    ),
     JobQueue: (InMemoryJobQueue, ("enqueue", "wait_for_result", "get_status", "depth")),
     DatasourceInspector: (StubDatasourceInspector, ("missing_fields",)),
     CatalogInvalidator: (InMemoryCatalogInvalidator, ("publish",)),
     RateLimiter: (InMemoryRateLimiter, ("allow",)),
     ResultExporter: (
         InMemoryResultExporter,
-        ("export", "stat", "open", "purge_expired"),
+        ("open_writer", "stat", "read_result", "open", "purge_expired"),
     ),
+    RowSink: (CollectingRowSink, ("write", "close", "abort")),
 }
 
 
@@ -341,29 +347,33 @@ async def test_catalog_repository_nova_publicacao_desativa_a_anterior():
 # --- QueryExecutor -------------------------------------------------------------------------
 
 
-async def test_query_executor_execute_devolve_o_resultado_programado(sample_result):
-    executor = StubQueryExecutor(result=sample_result)
+async def test_query_executor_empurra_as_linhas_para_o_sink_em_blocos():
+    linhas = [("SP", 1), ("RJ", 2), ("MG", 3)]
+    executor = StubQueryExecutor(rows=linhas, chunk_size=2)
     dataset = vendas_agregado_uf()
     request = QueryRequest(schema="vendas", dimensions=("sigla_uf",), measures=("valor_total",))
     columns = vendas_schema().columns_for(request)
+    sink = CollectingRowSink()
 
-    result = await executor.execute(dataset, request, columns)
+    streamed = await executor.execute(dataset, request, columns, sink)
 
-    assert result == sample_result
+    # O recorte em blocos é o ponto do contrato: o executor não entrega tudo de uma vez.
+    assert sink.chunks == [[("SP", 1), ("RJ", 2)], [("MG", 3)]]
+    assert streamed.row_count == 3
     assert executor.calls == [(dataset, request, columns)]
 
 
-async def test_query_executor_execute_sem_resultado_programado_monta_um_completed():
+async def test_query_executor_sem_linhas_nao_escreve_no_sink():
     executor = StubQueryExecutor()
     dataset = vendas_agregado_uf()
     request = QueryRequest(schema="vendas", dimensions=("sigla_uf",))
     columns = vendas_schema().columns_for(request)
+    sink = CollectingRowSink()
 
-    result = await executor.execute(dataset, request, columns)
+    streamed = await executor.execute(dataset, request, columns, sink)
 
-    assert result.status.value == "completed"
-    assert result.query_id == request.query_id
-    assert result.meta.dataset_used == dataset.name
+    assert sink.chunks == []
+    assert streamed.row_count == 0
 
 
 async def test_query_executor_propaga_erro_programado():
@@ -372,7 +382,7 @@ async def test_query_executor_propaga_erro_programado():
     request = QueryRequest(schema="vendas", dimensions=("sigla_uf",))
 
     with pytest.raises(QueryTimeoutError):
-        await executor.execute(dataset, request, ())
+        await executor.execute(dataset, request, (), CollectingRowSink())
 
 
 # --- RateLimiter (Marco 9) -----------------------------------------------------------------

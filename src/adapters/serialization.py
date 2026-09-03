@@ -106,12 +106,21 @@ def result_to_dict(result: QueryResult) -> dict[str, Any]:
     body["columns"] = [
         {"field": c.field, "type": c.type.value, "format": c.format} for c in result.columns
     ]
-    body["rows"] = [[jsonable(value) for value in row] for row in result.rows]
+    # `rows=None` (resultado transmitido, `QueryResult.streamed`) vira `None` no dicionário
+    # e não uma lista vazia: é a diferença entre "as linhas estão no artefato" e "o
+    # resultado tem zero linhas", e o round-trip precisa preservá-la. É o que deixa o
+    # valor de retorno do job no `arq` ser só o descritor, sem carregar as linhas.
+    body["rows"] = (
+        None
+        if result.rows is None
+        else [[jsonable(value) for value in row] for row in result.rows]
+    )
     body["meta"] = {
         "row_count": result.meta.row_count,
         "cached": result.meta.cached,
         "execution_ms": result.meta.execution_ms,
         "dataset_used": result.meta.dataset_used,
+        "total_rows": result.meta.total_rows,
     }
     return body
 
@@ -128,11 +137,23 @@ def dict_to_result(data: dict[str, Any]) -> QueryResult:
         for c in data["columns"]
     )
     meta = data["meta"]
+    rows = data.get("rows")
+    if rows is None:
+        return QueryResult.streamed(
+            query_id=data["query_id"],
+            columns=columns,
+            row_count=meta["row_count"],
+            total_rows=meta.get("total_rows"),
+            dataset_used=meta["dataset_used"],
+            cached=meta["cached"],
+            execution_ms=meta["execution_ms"],
+        )
     return QueryResult.completed(
         query_id=data["query_id"],
         columns=columns,
-        rows=[tuple(row) for row in data["rows"]],
+        rows=[tuple(row) for row in rows],
         dataset_used=meta["dataset_used"],
         cached=meta["cached"],
         execution_ms=meta["execution_ms"],
+        total_rows=meta.get("total_rows"),
     )

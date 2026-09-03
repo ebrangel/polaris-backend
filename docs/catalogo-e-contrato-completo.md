@@ -245,12 +245,22 @@ Se `query` estiver presente, os demais parâmetros são ignorados (evita ambigui
   ],
   "meta": {
     "row_count": 2,
+    "total_rows": 2,
     "cached": true,
     "execution_ms": 12,
     "dataset_used": "vendas_agregado_uf"
   }
 }
 ```
+
+`meta.row_count` é quantas linhas vieram; `meta.total_rows` é quantas o resultado teria
+**sem** `limit`/`offset` — o número que uma interface paginada precisa para saber quantas
+páginas existem. Os dois só diferem quando a consulta pagina.
+
+`total_rows` pode vir `null`, e isso significa "não foi apurado", nunca "zero": é o caso
+de um dataset Elasticsearch (não há função de janela) e o de um resultado vindo do cache.
+No caminho SQL o total é exato, e custa uma passada a mais só quando o resultado pode
+estar truncado — uma consulta que cabe inteira no `limit` não paga nada por ele.
 
 `meta.dataset_used` existe para depuração e observabilidade — permite ver qual fonte física atendeu cada requisição sem expor isso como algo que o cliente precisa declarar.
 
@@ -290,6 +300,7 @@ Content-Type: text/csv; charset=utf-8; header=present
 Content-Disposition: attachment; filename="q_8f2a1c.csv"
 X-Query-Id: q_8f2a1c
 X-Row-Count: 2
+X-Total-Rows: 2
 X-Cached: true
 X-Execution-Ms: 12
 X-Dataset-Used: vendas_agregado_uf
@@ -300,7 +311,9 @@ RJ,212904.10
 ```
 
 Como o CSV é uma grade de dados e não tem onde carregar o `meta` da seção 2.3, esses
-metadados saem em headers `X-*`.
+metadados saem em headers `X-*`. `X-Total-Rows` é a exceção que **some** quando o total
+não foi apurado: não existe `null` em HTTP, e um header vazio seria lido como zero — sem
+o header, o cliente sabe que não sabe.
 
 Regras de valor: `null` vira campo vazio; booleano vira `true`/`false`; data sai em ISO
 8601; número decimal sai com a precisão exata do banco. O `format` declarado na coluna
@@ -404,7 +417,19 @@ Tipos de erro previstos: `unknown_schema`, `unknown_field`, `invalid_filter`, `f
 
 ### 2.6 Paginação
 
-`limit`/`offset` no corpo da requisição, com `limit` máximo configurável por schema. Para exports grandes, `format=csv` (seção 2.3a) baixa direto, fora do fluxo JSON paginado. Ele ainda materializa o resultado inteiro antes de responder; um modo `csv_stream` de verdade — que transmita as linhas conforme o banco as devolve, sem passar por cache nem pela fila — exige um port de execução por streaming e fica para um marco próprio.
+`limit`/`offset` no corpo da requisição, com `limit` máximo configurável por schema, e
+`meta.total_rows` (seção 2.3) dizendo quantas páginas existem.
+
+O resultado **não** é mais materializado em memória: o worker lê o cursor do datasource em
+blocos de `FETCH_CHUNK_SIZE` linhas e escreve cada bloco direto nos destinos finais
+(arquivo de export e cache), e a API transmite a resposta a partir do arquivo — CSV do
+`.csv`, JSON do `.jsonl`. O pico de memória de uma consulta é o de um bloco, não o do
+resultado.
+
+O que ainda não existe é o `csv_stream` sem fila: hoje toda consulta é enfileirada e o
+cliente baixa um artefato já concluído. Transmitir as linhas ao cliente *enquanto* o banco
+as devolve pouparia a latência do job, ao custo de não haver mais nem cache nem
+`download_url` para aquela requisição — é um modo à parte, não o padrão.
 
 ---
 

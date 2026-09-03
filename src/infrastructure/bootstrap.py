@@ -107,6 +107,7 @@ async def build_context(settings: Settings) -> ApplicationContext:
         executors[connection_ref] = SQLAlchemyQueryExecutor(
             engine=engine,
             timeout_seconds=settings.query_timeout_seconds,
+            chunk_size=settings.fetch_chunk_size,
         )
     for connection_ref, client in es_clients.items():
         executors[connection_ref] = ElasticsearchQueryExecutor(

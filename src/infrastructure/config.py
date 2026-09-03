@@ -58,6 +58,10 @@ class Settings:
     default_max_limit: int = 50_000
     #: Tamanho do pool de conexões por datasource (aberto pelo worker).
     query_pool_size: int = 10
+    #: Linhas lidas do cursor por vez (Marco 12). Não é o `LIMIT` da consulta — é o lote
+    #: que viaja do banco para o worker de cada vez, e portanto o teto de memória do laço
+    #: de leitura. Maior reduz idas e voltas; menor achata o pico de memória.
+    fetch_chunk_size: int = 1000
     # --- Export de consultas pesadas (seção 2.4a) -------------------------------------
     #: Diretório onde o worker grava os CSV e de onde a API os serve. **Os dois
     #: processos precisam enxergar o mesmo caminho** — mesmo host, ou volume
@@ -94,6 +98,7 @@ def load_settings() -> Settings:
         ),
         default_max_limit=int(os.environ.get("DEFAULT_MAX_LIMIT", "50000")),
         query_pool_size=int(os.environ.get("QUERY_POOL_SIZE", "10")),
+        fetch_chunk_size=int(os.environ.get("FETCH_CHUNK_SIZE", "1000")),
         export_dir=os.environ.get("EXPORT_DIR", "exports"),
         export_ttl_seconds=int(os.environ.get("EXPORT_TTL_SECONDS", "86400")),
         slow_query_threshold_ms=int(os.environ.get("SLOW_QUERY_THRESHOLD_MS", "2000")),

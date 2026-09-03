@@ -8,7 +8,7 @@ import pytest
 from fixtures import catalog, vendas_schema
 
 from application.use_cases.run_queued_query import RunQueuedQuery
-from domain.models import Catalog, QueryRequest, QueryResult, QueryStatus
+from domain.models import Catalog, QueryRequest, QueryStatus
 from fakes import InMemoryCacheGateway, InMemoryResultExporter, StubQueryExecutor
 
 
@@ -74,14 +74,7 @@ async def test_erro_do_executor_propaga():
 
 
 async def test_consulta_pesada_lenta_gera_log_de_warning(caplog):
-    slow_result = QueryResult.completed(
-        query_id="q_pesado1",
-        columns=(),
-        rows=(),
-        dataset_used="vendas_agregado_uf",
-        execution_ms=9000,
-    )
-    stub = StubQueryExecutor(result=slow_result)
+    stub = StubQueryExecutor(execution_ms=9000)
     run = RunQueuedQuery(
         catalog=catalog(),
         executors={"env:DW_VENDAS_PG_URL": stub},
@@ -93,18 +86,11 @@ async def test_consulta_pesada_lenta_gera_log_de_warning(caplog):
         await run(request, dataset_name="vendas_agregado_uf")
 
     assert any("consulta lenta" in record.message for record in caplog.records)
-    assert any("q_pesado1" in record.message for record in caplog.records)
+    assert any(request.query_id in record.message for record in caplog.records)
 
 
 async def test_sem_threshold_configurado_nunca_loga(caplog):
-    slow_result = QueryResult.completed(
-        query_id="q_pesado2",
-        columns=(),
-        rows=(),
-        dataset_used="vendas_agregado_uf",
-        execution_ms=999_999,
-    )
-    stub = StubQueryExecutor(result=slow_result)
+    stub = StubQueryExecutor(execution_ms=999_999)
     run = RunQueuedQuery(catalog=catalog(), executors={"env:DW_VENDAS_PG_URL": stub})
     request = QueryRequest(schema="vendas", dimensions=("sigla_uf",))
 
@@ -117,11 +103,14 @@ async def test_sem_threshold_configurado_nunca_loga(caplog):
 # --- Cache do resultado (o worker é o único escritor) --------------------------------------
 
 
-async def test_grava_no_cache_quando_completed():
+async def test_grava_no_cache_as_linhas_que_atravessaram_o_sink():
+    """O que volta pela fila é o descritor (`rows=None`); o que fica no cache são as
+    linhas. Os dois descrevem o mesmo resultado, mas só um deles as carrega."""
     cache = InMemoryCacheGateway()
+    linhas = [("SP", 458320.50), ("RJ", 212904.10)]
     run = RunQueuedQuery(
         catalog=catalog(),
-        executors={"env:DW_VENDAS_PG_URL": StubQueryExecutor()},
+        executors={"env:DW_VENDAS_PG_URL": StubQueryExecutor(rows=linhas)},
         cache=cache,
         cache_ttl_seconds=3600,
     )
@@ -129,20 +118,33 @@ async def test_grava_no_cache_quando_completed():
 
     result = await run(request, dataset_name="vendas_agregado_uf")
 
-    assert await cache.get(request.cache_key) == result
+    assert result.rows is None
+    assert result.meta.row_count == 2
+
+    cacheado = await cache.get(request.cache_key)
+    assert cacheado is not None
+    assert cacheado.rows == (("SP", 458320.50), ("RJ", 212904.10))
+    assert cacheado.meta.row_count == result.meta.row_count
+    assert cacheado.columns == result.columns
 
 
-async def test_nao_grava_no_cache_quando_failed():
+async def test_erro_do_executor_nao_deixa_entrada_no_cache():
+    """O executor levanta em vez de devolver um resultado `failed`, e o sink é abortado —
+    nada pode ficar visível com um resultado pela metade."""
+    from domain.errors import QueryTimeoutError
+
     cache = InMemoryCacheGateway()
-    failed = QueryResult.failed("q_falhou1", error="erro no datasource")
     run = RunQueuedQuery(
         catalog=catalog(),
-        executors={"env:DW_VENDAS_PG_URL": StubQueryExecutor(result=failed)},
+        executors={
+            "env:DW_VENDAS_PG_URL": StubQueryExecutor(raises=QueryTimeoutError("estourou"))
+        },
         cache=cache,
     )
     request = QueryRequest(schema="vendas", dimensions=("sigla_uf",))
 
-    await run(request, dataset_name="vendas_agregado_uf")
+    with pytest.raises(QueryTimeoutError):
+        await run(request, dataset_name="vendas_agregado_uf")
 
     assert await cache.get(request.cache_key) is None
 
@@ -158,9 +160,9 @@ async def test_sem_cache_configurado_nao_grava():
     assert result.status is QueryStatus.COMPLETED
 
 
-async def test_falha_ao_gravar_no_cache_nao_derruba_o_job(caplog):
+async def test_falha_ao_abrir_o_cache_nao_derruba_o_job(caplog):
     class _ExplodingCache(InMemoryCacheGateway):
-        async def set(self, key, result, ttl_seconds=None):
+        async def open_writer(self, key, columns, query_id, dataset_used, ttl_seconds=None):
             raise ConnectionError("redis fora do ar")
 
     run = RunQueuedQuery(
@@ -175,7 +177,38 @@ async def test_falha_ao_gravar_no_cache_nao_derruba_o_job(caplog):
         result = await run(request, dataset_name="vendas_agregado_uf")
 
     assert result.status is QueryStatus.COMPLETED
-    assert "falha ao gravar" in caplog.text
+    assert "falha ao abrir o cache" in caplog.text
+
+
+async def test_falha_de_um_destino_no_meio_nao_impede_o_outro(caplog):
+    """O ponto do `FanOutSink`: o resultado já foi calculado, então perder o cache é
+    perder uma otimização — o export tem de sair mesmo assim."""
+
+    class _ExplodingCache(InMemoryCacheGateway):
+        async def open_writer(self, key, columns, query_id, dataset_used, ttl_seconds=None):
+            sink = await super().open_writer(key, columns, query_id, dataset_used, ttl_seconds)
+
+            async def _explode(rows):
+                raise ConnectionError("redis caiu no meio da escrita")
+
+            sink.write = _explode
+            return sink
+
+    exporter = InMemoryResultExporter()
+    run = RunQueuedQuery(
+        catalog=catalog(),
+        executors={"env:DW_VENDAS_PG_URL": StubQueryExecutor(rows=[("SP", 1.0)])},
+        cache=_ExplodingCache(),
+        result_exporter=exporter,
+    )
+    request = QueryRequest(schema="vendas", dimensions=("sigla_uf",), measures=("valor_total",))
+
+    with caplog.at_level(logging.WARNING):
+        result = await run(request, dataset_name="vendas_agregado_uf")
+
+    assert result.status is QueryStatus.COMPLETED
+    assert await exporter.stat(result.query_id) is not None
+    assert "os demais seguem" in caplog.text
 
 
 # --- Export do resultado (seção 2.4a) ---------------------------------------------------
@@ -227,4 +260,4 @@ async def test_falha_de_export_nao_derruba_o_job(caplog):
         result = await run(request, dataset_name="vendas_agregado_uf")
 
     assert result.status is QueryStatus.COMPLETED
-    assert "falha ao exportar" in caplog.text
+    assert "falha ao abrir o export" in caplog.text

@@ -63,6 +63,9 @@ def test_post_devolve_o_formato_da_secao_2_3(client, job_queue, financeiro):
             "cached": True,
             "execution_ms": 12,
             "dataset_used": "vendas_agregado_uf",
+            # `null` explícito, e não a chave ausente: distingue "não foi apurado"
+            # (aqui, um resultado que veio do cache) de "o total é zero".
+            "total_rows": None,
         },
     }
 

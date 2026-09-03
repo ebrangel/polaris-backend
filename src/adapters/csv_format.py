@@ -15,11 +15,11 @@ razão o `Decimal` sai como texto exato vindo de `jsonable()`, sem virar `float`
 
 import csv
 import json
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from typing import Any
 
 from adapters.serialization import jsonable
-from domain.models import QueryResult
+from domain.models import Column, QueryResult
 
 #: RFC 4180 §2.1: registros terminados por CRLF.
 LINE_TERMINATOR = "\r\n"
@@ -68,30 +68,57 @@ def _cell(value: Any) -> Any:
     return normalized
 
 
+class CsvRowFormatter:
+    """Formatador incremental: recebe uma linha por vez, devolve o texto de uma linha.
+
+    Existe para o caminho de streaming, onde as linhas chegam em blocos vindos do cursor
+    e não há um `QueryResult` de onde iterar. Guarda o `csv.writer` e o `_LineSink` entre
+    as chamadas, de modo que a configuração da RFC 4180 seja feita uma vez só e nenhum
+    buffer cresça com o resultado: o custo de memória é sempre o de uma linha.
+    """
+
+    __slots__ = ("_sink", "_writer")
+
+    def __init__(self, *, delimiter: str = DEFAULT_DELIMITER) -> None:
+        self._sink = _LineSink()
+        self._writer = csv.writer(
+            self._sink,
+            delimiter=delimiter,
+            lineterminator=LINE_TERMINATOR,
+            quoting=csv.QUOTE_MINIMAL,
+        )
+
+    def header(self, columns: Iterable[Column]) -> str:
+        """Linha de cabeçalho com os nomes lógicos dos campos.
+
+        Traz `Column.field` — o nome do modelo lógico que o cliente pediu, nunca a coluna
+        física do dataset (convenção do CLAUDE.md).
+        """
+        self._writer.writerow([column.field for column in columns])
+        return self._sink.take()
+
+    def row(self, values: Sequence[Any]) -> str:
+        self._writer.writerow([_cell(value) for value in values])
+        return self._sink.take()
+
+
 def csv_lines(
     result: QueryResult, *, delimiter: str = DEFAULT_DELIMITER
 ) -> Iterator[str]:
-    """Linhas do CSV: cabeçalho com os nomes lógicos dos campos e, depois, os dados.
+    """Linhas do CSV de um resultado já em memória — cabeçalho e, depois, os dados.
 
-    O cabeçalho traz `Column.field` — o mesmo nome lógico do modelo lógico do schema
-    que o cliente pediu, nunca a coluna física do dataset (convenção do CLAUDE.md).
-
-    É um gerador, então quem consome escreve linha a linha (no socket, na API; no
-    arquivo, no worker) sem montar o CSV inteiro como uma string única. O
-    `QueryResult` em si já está materializado — reduzir *isso* é o que exigiria um port
-    de execução por streaming, fora do escopo deste módulo.
+    É o caminho de quem tem as linhas em mãos: um acerto de cache respondido em CSV. Um
+    gerador, então a API escreve linha a linha no socket sem montar o CSV inteiro como
+    uma string única. Quem está lendo um cursor não passa por aqui — usa
+    `CsvRowFormatter` direto, que é o que não exige um `QueryResult` materializado.
     """
-    sink = _LineSink()
-    writer = csv.writer(
-        sink,
-        delimiter=delimiter,
-        lineterminator=LINE_TERMINATOR,
-        quoting=csv.QUOTE_MINIMAL,
-    )
+    if result.rows is None:
+        raise ValueError(
+            f"O resultado '{result.query_id}' não carrega as linhas em memória — "
+            "use `CsvRowFormatter` sobre a fonte que as tem."
+        )
 
-    writer.writerow([column.field for column in result.columns])
-    yield sink.take()
-
+    formatter = CsvRowFormatter(delimiter=delimiter)
+    yield formatter.header(result.columns)
     for row in result.rows:
-        writer.writerow([_cell(value) for value in row])
-        yield sink.take()
+        yield formatter.row(row)
