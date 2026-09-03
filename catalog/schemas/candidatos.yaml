@@ -1,0 +1,185 @@
+version: 1
+schema: candidatos
+description: "Candidatos — modelo plano sobre ADMDDELEITORAL.CAND_CANDIDATO (Oracle)"
+
+# Teto de linhas da seção 2.6 — ver o comentário em `vendas.yaml`.
+max_limit: 50000
+
+dimensions:
+  ano_eleicao:
+    type: number
+    filterable: true
+  tipo_eleicao:
+    type: string
+    filterable: true
+  turno:
+    type: number
+    filterable: true
+  sigla_uf:
+    type: string
+    filterable: true
+  sigla_ue:
+    type: string
+    filterable: true
+  nome_ue:
+    type: string
+    filterable: true
+  cargo:
+    type: string
+    filterable: true
+  numero_candidato:
+    type: number
+    filterable: true
+  nome_candidato:
+    type: string
+    filterable: true
+  nome_urna_candidato:
+    type: string
+    filterable: true
+  situacao_candidatura:
+    type: string
+    filterable: true
+  sigla_partido:
+    type: string
+    filterable: true
+  nome_partido:
+    type: string
+    filterable: true
+  sigla_federacao:
+    type: string
+    filterable: true
+  nome_coligacao:
+    type: string
+    filterable: true
+  nacionalidade:
+    type: string
+    filterable: true
+  sigla_uf_nascimento:
+    type: string
+    filterable: true
+  sexo:
+    type: string
+    filterable: true
+  grau_instrucao:
+    type: string
+    filterable: true
+  estado_civil:
+    type: string
+    filterable: true
+  cor_raca:
+    type: string
+    filterable: true
+  ocupacao:
+    type: string
+    filterable: true
+  situacao_totalizacao:
+    type: string
+    filterable: true
+  faixa_etaria:
+    type: string
+    filterable: true
+  deficiente:
+    type: string
+    filterable: true
+  reeleicao:
+    type: string
+    filterable: true
+
+measures:
+  despesa_max_campanha:
+    agg: avg
+    format: currency
+  total_candidatos:
+    agg: sum
+  candidatos_eleitos:
+    agg: sum
+  candidatos_segundo_turno:
+    agg: sum
+  candidatos_nao_eleitos:
+    agg: sum
+  candidatos_suplentes:
+    agg: sum
+  candidatos_deficientes:
+    agg: sum
+
+datasets:
+  - name: candidatos_oracle
+    datasource:
+      type: oracle
+      connection_ref: env:DW_CANDIDATOS_ORACLE_URL
+    provides:
+      dimensions:
+        [
+          ano_eleicao,
+          tipo_eleicao,
+          turno,
+          sigla_uf,
+          sigla_ue,
+          nome_ue,
+          cargo,
+          numero_candidato,
+          nome_candidato,
+          nome_urna_candidato,
+          situacao_candidatura,
+          sigla_partido,
+          nome_partido,
+          sigla_federacao,
+          nome_coligacao,
+          nacionalidade,
+          sigla_uf_nascimento,
+          sexo,
+          grau_instrucao,
+          estado_civil,
+          cor_raca,
+          ocupacao,
+          situacao_totalizacao,
+          faixa_etaria,
+          deficiente,
+          reeleicao,
+        ]
+      measures:
+        [
+          despesa_max_campanha,
+          total_candidatos,
+          candidatos_eleitos,
+          candidatos_segundo_turno,
+          candidatos_nao_eleitos,
+          candidatos_suplentes,
+          candidatos_deficientes,
+        ]
+    table:
+      source: ADMDDELEITORAL.CAND_CANDIDATO
+      mapping:
+        ano_eleicao: { column: AA_ELEICAO }
+        tipo_eleicao: { column: NM_TIPO_ELEICAO }
+        turno: { column: NR_TURNO }
+        sigla_uf: { column: SG_UF }
+        sigla_ue: { column: SG_UE }
+        nome_ue: { column: NM_UE }
+        cargo: { column: DS_CARGO }
+        numero_candidato: { column: NR_CANDIDATO }
+        nome_candidato: { column: NM_CANDIDATO }
+        nome_urna_candidato: { column: NM_URNA_CANDIDATO }
+        situacao_candidatura: { column: DS_SITUACAO_CANDIDATURA }
+        sigla_partido: { column: SG_PARTIDO }
+        nome_partido: { column: NM_PARTIDO }
+        sigla_federacao: { column: SG_FEDERACAO }
+        nome_coligacao: { column: NM_COLIGACAO }
+        nacionalidade: { column: DS_NACIONALIDADE }
+        sigla_uf_nascimento: { column: SG_UF_NASCIMENTO }
+        sexo: { column: DS_SEXO }
+        grau_instrucao: { column: DS_GRAU_INSTRUCAO }
+        estado_civil: { column: DS_ESTADO_CIVIL }
+        cor_raca: { column: DS_COR_RACA }
+        ocupacao: { column: DS_OCUPACAO }
+        situacao_totalizacao: { column: DS_SIT_TOT_TURNO }
+        faixa_etaria: { column: DS_FAIXA_ETARIA }
+        deficiente: { column: ST_DEFICIENTE }
+        reeleicao: { column: ST_REELEICAO }
+        despesa_max_campanha: { column: VR_DESPESA_MAX_CAMPANHA, agg: avg }
+        total_candidatos: { column: QT_CANDIDATOS, agg: sum }
+        candidatos_eleitos: { column: QT_CAND_ELEITOS, agg: sum }
+        candidatos_segundo_turno: { column: QT_CAND_TURNO2, agg: sum }
+        candidatos_nao_eleitos: { column: QT_CAND_NAO_ELEITOS, agg: sum }
+        candidatos_suplentes: { column: QT_CAND_SUPLENTES, agg: sum }
+        candidatos_deficientes: { column: QT_CAND_DEFICIENTES, agg: sum }

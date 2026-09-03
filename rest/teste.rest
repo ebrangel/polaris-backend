@@ -1,7 +1,7 @@
 GET http://localhost:8000/v1/catalog
 
 ###
-GET http://localhost:8000/v1/catalog/estoque
+GET http://localhost:8000/v1/catalog/candidatos
 
 ###
 GET http://localhost:8000/internal/observability
@@ -90,3 +90,31 @@ GET http://localhost:8000/v1/query/q_9d31be
 ###
 # Baixa o CSV que o worker gravou
 GET http://localhost:8000/v1/query/q_9d31be/download
+
+
+# Consulta ORACLE Candidaturas
+
+###
+GET http://localhost:8000/v1/catalog/candidatos
+
+###
+POST http://localhost:8000/v1/query HTTP/1.1
+content-type: application/json
+#accept: text/csv
+
+{
+    "schema": "candidatos",
+    "dimensions": ["ano_eleicao", "sigla_uf", "sigla_partido"],
+    "measures": ["total_candidatos", "candidatos_eleitos"],
+    "limit": null,
+    "offset": 0,
+    "filters": [
+        { "field": "ano_eleicao", "operator": "in", "value": [2020, 2022] }
+    ],
+    "order_by": [
+        { "field": "ano_eleicao", "direction": "asc" }
+    ]
+}
+
+###
+GET http://localhost:8000/v1/query/q_0e7e04

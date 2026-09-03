@@ -64,14 +64,12 @@ async def main() -> int:
         schemas.append(schema)
 
     relational_engines = db.build_relational_engines(
-        schemas,
-        light_pool_size=settings.light_pool_size,
-        heavy_pool_size=settings.heavy_pool_size,
+        schemas, pool_size=settings.query_pool_size
     )
     types = db.datasource_types(schemas)
     inspectors = {
-        connection_ref: PostgresInspector(engines.light)
-        for connection_ref, engines in relational_engines.items()
+        connection_ref: PostgresInspector(engine)
+        for connection_ref, engine in relational_engines.items()
         if types.get(connection_ref) is DatasourceType.POSTGRES
     }
 
